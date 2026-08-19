@@ -65,7 +65,7 @@ tunnel connection, and many tunnels can run from one agent process.
 
 For the full protocol and implementation details, see
 [`docs/architecture.md`](docs/architecture.md) and the
-[developer guide](README.md).
+[developer guide](readmedev.md).
 
 ---
 
@@ -78,8 +78,10 @@ For the full protocol and implementation details, see
   VNC): `kproxy tcp 22`.
 - **WebSocket support** — WebSocket and other HTTP upgrade requests
   (`Connection: upgrade`) are tunneled transparently with no extra config.
-- **Multiple tunnels** — an agent can open several tunnels at once (HTTP and
-  TCP) from one process.
+- **Multiple tunnels** — run several agent processes in parallel for multiple
+  tunnels (`kproxy http 8082 --subdomain api` and `kproxy tcp 3306` side by
+  side). The agent core already supports many tunnels per connection; a
+  tunnel config file to start them all from one process lands in Phase 2.
 
 ### Public endpoints
 - **Random hash subdomains** by default: `https://7f3a9c21.yourdomain.com`.
@@ -120,7 +122,7 @@ For the full protocol and implementation details, see
 |---|---|
 | **Server** | A machine with a public IP (VPS), ports 80/443 open, and a domain you control with a wildcard `*.domain` A/AAAA record pointing at it. Linux recommended. |
 | **Agent** | Any machine with internet access (dev laptop, CI runner). No public IP, no router changes needed. |
-| **Build** | Go ≥ 1.22 (only needed to build from source; released binaries need nothing). |
+| **Build** | Go ≥ 1.24 (only needed to build from source; released binaries need nothing). |
 
 ---
 
@@ -463,8 +465,8 @@ binary directly on the host or in a scratch container.
 ## Development
 
 kproxy is written in **Go** and ships as two binaries sharing core packages
-under `internal/`. See **[`README.md` developer guide](README.md)** — the full
-developer documentation covering the architecture, the wire protocol, the
+under `internal/`. See **[`readmedev.md` developer guide](readmedev.md)** — the
+full developer documentation covering the architecture, the wire protocol, the
 code layout, testing, and how to extend kproxy.
 
 Quick commands:
