@@ -1,0 +1,28 @@
+# Binaries
+kproxy
+kproxyd
+*.exe
+*.dll
+dist/
+build/
+
+# Runtime data
+data/
+*.db
+*.db-*
+*.sqlite
+kproxy.log
+
+# Go
+vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
