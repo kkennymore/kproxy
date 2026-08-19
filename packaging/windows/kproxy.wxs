@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="kproxy agent"
+    Manufacturer="kproxy"
+    Language="1033" Codepage="1252"
+    Version="$(var.Version)"
+    Scope="perMachine"
+    UpgradeCode="94D8EBB4-5A7B-429B-A987-9F1604BA8D47">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of kproxy is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="kproxy">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="KPROXY_EXE" Name="kproxy.exe" Source="$(var.ExePath)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="MainFeature" Title="kproxy agent" Level="1">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Package>
+</Wix>

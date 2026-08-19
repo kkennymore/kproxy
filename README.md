@@ -78,10 +78,12 @@ For the full protocol and implementation details, see
   VNC): `kproxy tcp 22`.
 - **WebSocket support** — WebSocket and other HTTP upgrade requests
   (`Connection: upgrade`) are tunneled transparently with no extra config.
-- **Multiple tunnels** — run several agent processes in parallel for multiple
-  tunnels (`kproxy http 8082 --subdomain api` and `kproxy tcp 3306` side by
-  side). The agent core already supports many tunnels per connection; a
-  tunnel config file to start them all from one process lands in Phase 2.
+- **Multiple tunnels** — start many tunnels from one process with a tunnel
+  config file: `kproxy tunnels -f tunnels.json`, or run several `kproxy`
+  commands side by side (`kproxy http 8082 --subdomain api` and
+  `kproxy tcp 3306`).
+- **TCP port pinning** — request a specific public port for a TCP tunnel:
+  `kproxy tcp 3306 --port 2200` → `tcp://yourdomain.com:2200`.
 
 ### Public endpoints
 - **Random hash subdomains** by default: `https://7f3a9c21.yourdomain.com`.
@@ -89,17 +91,41 @@ For the full protocol and implementation details, see
   `https://myapp.yourdomain.com`.
 - **Custom domains**: `kproxy http 8082 --domain app.client.com` — your client
   points their domain at your server and sees the app on their own URL.
+- **Custom-domain verification** — when the operator sets `--verify-key`, a
+  custom domain is only honored once a DNS TXT record proves you control it
+  (see [Domain verification](#domain-verification)).
 - **TCP ports** are allocated automatically from a configurable public range
-  (default `20000–29999`): `tcp://yourdomain.com:20000`.
+  (default `20000–29999`): `tcp://yourdomain.com:20000`. To keep a fixed port,
+  pin it with `--port` (see below).
 
 ### Reliability
 - **Automatic reconnect** with exponential backoff (1s → 30s) when the network
   blips; tunnels are re-registered transparently.
 - **Keepalive pings** on both sides detect and drop half-open connections.
+- **Graceful tunnel close** — tunnels are released immediately on agent exit
+  and when a local app stops accepting connections; the endpoint is freed and
+  the tunnel reopens automatically when the app comes back (new public URL for
+  random-hash hosts).
 - **Graceful shutdown** on `Ctrl+C` / `SIGTERM` for both the agent and server.
 
 ### Security
-- **Agent authentication** via an API key or a shared admin key.
+- **Agent authentication** via per-user API keys, hashed with **argon2id**
+  (secrets are 128-bit random and shown exactly once at issuance).
+- **Per-key limits** — issue keys with an HTTP request rate cap
+  (`--rate`, enforced with a 429), a bandwidth cap (`--bandwidth`, paced
+  both directions), and an allowed-subdomain allowlist (`--subdomain`).
+- **Per-tunnel protection** — protect a single tunnel with HTTP Basic auth
+  (`--basic-auth`), restrict it to IP allow/deny lists (`--ip-allow`,
+  `--ip-deny`), and bound request bodies (`--max-request-size` → 413) and
+  request duration (`--request-timeout` → 503). Limits are set by the agent
+  but enforced by the server, so the relay stays in control.
+- **Request IDs** — every proxied request carries an `X-Request-Id` header
+  end-to-end and appears in the live request inspector, so a slow request can
+  be correlated across client, relay and app logs.
+- **Custom-domain verification** — with `--verify-key` the server issues a DNS
+  TXT token that proves you control a custom domain before honoring it.
+- **Admin API** on its own loopback listener (default `127.0.0.1:55556`) for
+  issuing/revoking keys, authenticated with `--admin-key`.
 - **HTTPS** on public endpoints via automatic LetsEncrypt certificates
   (ACME) or your own certificates.
 - **TLS 1.2+** minimum, **first-run key prompt** that stores your key in a
@@ -108,6 +134,11 @@ For the full protocol and implementation details, see
   on the dev machine.
 
 ### Operations
+- **Web dashboard** — a React admin UI is embedded in the server binary and
+  served on the admin listener: live tunnel list, a real-time request
+  inspector (host / method / path / status / duration / bytes over SSE), and
+  API-key management with per-key limits. Log in with the admin key; it is
+  separate from agent API keys.
 - **JSON or human-readable logs** (`--json`, `--verbose`).
 - **Single static binary** — no runtime dependencies, no installer cruft.
 - **Cross-platform** — Windows, Linux (deb/rpm), macOS; amd64 and arm64.
@@ -144,9 +175,18 @@ go install ./cmd/kproxy ./cmd/kproxyd
 
 ### Prebuilt binaries
 
-Prebuilt installers and binaries (Windows MSI/zip, Linux deb/rpm/tar.gz, macOS
-pkg/zip) are planned for Phase 6 of the roadmap. Until then, build from
-source.
+Prebuilt releases are published for every tagged version:
+
+| Platform | Artifacts |
+|---|---|
+| Windows | `.zip`, `.msi` (WiX installer) |
+| Linux | `.tar.gz`, `.deb`, `.rpm` (amd64 + arm64) |
+| macOS | `.zip` (amd64 + arm64) |
+
+Every archive contains both binaries (`kproxy`, `kproxyd`) plus a
+`checksums.txt`. See the [releases page](https://github.com/kkennymore/kproxy/releases)
+for the latest. For a one-command Linux server install (systemd + config),
+see [Deployment](#deployment).
 
 ---
 
@@ -160,22 +200,38 @@ kproxyd \
   --http-addr :80 \
   --https-addr :443 \
   --acme-email you@example.com \
-  --admin-key "choose-a-strong-secret"
+  --admin-key "choose-a-strong-admin-secret" \
+  --data-dir /var/lib/kproxy
 ```
 
 What this does:
 - Listens for agent connections on the control port (`:55555` by default).
 - Serves public HTTPS on `:443` (automatic LetsEncrypt certs via `--acme-email`)
   and redirects `:80` to HTTPS.
-- Requires agents to present `--admin-key`.
+- Runs the admin API on `127.0.0.1:55556` (loopback) so operators can issue
+  API keys with `--admin-key`.
 
 > **No domain yet?** You can run in dev mode without HTTPS:
 > `kproxyd --domain localhost --http-addr :8080 --https-addr "" --admin-key test`
 
-### 2. Start the agent (on your dev machine)
+### 2. Issue an API key (once)
 
 ```sh
-kproxy http 8082 --server http://your-vps:55555 --api-key "choose-a-strong-secret"
+kproxy key create --name my-laptop --ttl 30d --admin-key "choose-a-strong-admin-secret"
+# Created key:
+#   ID:      k_9f3a2c11
+#   Name:    my-laptop
+#   Expires: 2026-09-18T12:00:00+02:00
+#   Secret:  kproxy_2f8c...   ← shown only once, save it
+```
+
+The server stores only the argon2id hash of the secret; the plaintext secret
+is returned exactly once. Without an API key the server refuses agents.
+
+### 3. Start the agent (on your dev machine)
+
+```sh
+kproxy http 8082 --server http://your-vps:55555 --api-key "kproxy_2f8c..."
 ```
 
 If you omit `--api-key`, kproxy prompts for one on first run and stores it in
@@ -185,7 +241,7 @@ your config file so future runs need no arguments:
 kproxy http 8082 --server http://your-vps:55555
 ```
 
-### 3. Share the URL
+### 4. Share the URL
 
 ```
 Tunnel online on yourdomain.com
@@ -204,6 +260,8 @@ hosted. Share it with your client — that's the whole point.
 ```
 kproxy http <port> [flags]     expose an HTTP service
 kproxy tcp <port>  [flags]     expose a raw TCP service
+kproxy tunnels -f FILE [flags] expose several tunnels from one process
+kproxy key <cmd> [flags]       manage api keys on the relay
 ```
 
 | Flag | Default | Description |
@@ -211,6 +269,12 @@ kproxy tcp <port>  [flags]     expose a raw TCP service
 | `--subdomain NAME` | random | Request a specific subdomain (`myapp` → `myapp.domain`) |
 | `--domain HOST` | — | Expose on a custom domain you control (`app.client.com`) |
 | `--local-host HOST` | `127.0.0.1` | Local host/interface to forward to |
+| `--port PORT` | auto | Request a specific public TCP port (`tcp` tunnels only) |
+| `--basic-auth user:pass` | — | Protect the tunnel with HTTP Basic auth (`http` only) |
+| `--ip-allow CIDR` | any | Comma-separated IP/CIDR allowlist for public clients (`http`/`tcp`) |
+| `--ip-deny CIDR` | — | Comma-separated IP/CIDR denylist; deny wins over allow (`http`/`tcp`) |
+| `--max-request-size SIZE` | unlimited | Cap request bodies, e.g. `1mb`; oversized requests get `413` (`http` only) |
+| `--request-timeout DURATION` | none | Bound request duration, e.g. `30s`; timed-out requests get `503` (`http` only) |
 | `--server URL` | `http://localhost:55555` | Relay server endpoint (`http://` or `https://`) |
 | `--api-key KEY` | — | API key for the relay (prompted on first run if absent) |
 | `--config PATH` | platform default | Config file to read/write instead of the default |
@@ -220,7 +284,43 @@ kproxy tcp <port>  [flags]     expose a raw TCP service
 Environment variables (used when the flag is not set): `KPROXY_SERVER`,
 `KPROXY_API_KEY`.
 
+`kproxy tunnels` takes a `-f FILE` tunnel config file (see
+[Configuration](#configuration)) and opens every tunnel in it from one agent
+process. It shares the credential precedence of the other commands; the file
+may also carry its own `server_url`/`api_key` as fallbacks.
+
+#### Managing API keys
+
+```
+kproxy key create [--name NAME] [--ttl DURATION] [--rate N] [--bandwidth SIZE] [--subdomain a,b] --admin-url URL --admin-key SECRET
+kproxy key revoke <ID>         --admin-url URL --admin-key SECRET
+kproxy key list                --admin-url URL --admin-key SECRET
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--admin-url` | `http://127.0.0.1:55556` | Admin API endpoint (the server's loopback admin listener) |
+| `--admin-key` | env `KPROXY_ADMIN_KEY` | Admin secret that authenticates the request |
+| `--name` | — | Human label for a new key |
+| `--ttl` | never | Key lifetime: `24h`, `7d`, `30d`, … |
+| `--rate` | 0 (unlimited) | Max HTTP requests per second; excess requests get `429` |
+| `--bandwidth` | 0 (unlimited) | Max tunnel throughput, e.g. `1mb`, `512kb`, `2.5gb` (paced both directions) |
+| `--subdomain` | any | Comma-separated allowlist of subdomains/domains this key may claim |
+
+Revoking a key takes effect immediately: connected agents keep their current
+tunnels until they disconnect, and any reconnect is refused with
+`api key revoked`.
+
 Global commands: `kproxy --version`, `kproxy help`.
+
+#### Managing custom domains
+
+```
+kproxy domain verify-token <host>  --admin-url URL --admin-key SECRET
+```
+
+Prints the DNS TXT record to publish to prove you control `<host>` (see
+[Domain verification](#domain-verification)).
 
 ### kproxyd (relay server)
 
@@ -234,17 +334,44 @@ kproxyd --domain example.com [flags]
 | `--control-addr` | `:55555` | Listen address for agent control connections |
 | `--http-addr` | `:80` | Public HTTP listener (ACME challenges + redirect to HTTPS) |
 | `--https-addr` | `:443` | Public HTTPS listener; set `""` to disable HTTPS |
-| `--admin-key` | *(empty)* | Shared secret agents must present; empty allows all (dev only) |
+| `--admin-key` | *(empty)* | Secret for the admin API and dashboard (`kproxy key ...`); empty disables the admin API |
+| `--admin-addr` | `127.0.0.1:55556` | Admin API + web dashboard listener; set `""` to disable |
 | `--tcp-port-range` | `20000-29999` | Public port range allocated to TCP tunnels |
 | `--acme-email` | — | Email for LetsEncrypt; enables automatic certificates |
 | `--tls-cert` / `--tls-key` | — | Paths to your own certificate and private key |
-| `--data-dir` | `./data` | Directory for the certificate cache and runtime state |
+| `--verify-key` | — | Secret enabling custom-domain verification; when set, custom domains are only honored after their DNS TXT record matches |
+| `--data-dir` | `./data` | Directory for the certificate cache, key store (`keys.json`) and runtime state |
 | `--verbose` | off | Debug-level logging |
 | `--json` | off | JSON log output |
 | `--version` | — | Print version and exit |
 
 > Exactly one of `--acme-email` or `--tls-cert/--tls-key` is required when
 > `--https-addr` is enabled.
+
+### Web dashboard
+
+The admin listener serves both the control API (`/api/v1/...`) and an embedded
+web dashboard. Point a browser at it and log in with `--admin-key`:
+
+```sh
+open http://127.0.0.1:55556          # or port-forward / SSH -L to your VPS
+```
+
+The dashboard shows:
+
+- **Tunnels** — every live tunnel with its public URL, protocol, local target,
+  agent ID, opened time, request count and traffic so far.
+- **Live requests** — each proxied request streams in as it happens (host,
+  method, path, status, duration, response bytes).
+- **API keys** — create keys with `--name`/`--ttl`/`--rate`/`--bandwidth`/
+  `--subdomain` limits, reveal the one-time secret, and revoke keys.
+
+The dashboard is a React + Vite app embedded into the server binary at build
+time; the operator does not need Node.js installed. Rebuild it with
+`make web` when changing `web/`.
+
+> The dashboard and the admin CLI are just two clients of the same versioned
+> control API — anything the UI does, `kproxy key ...` can do too.
 
 ---
 
@@ -266,11 +393,24 @@ kproxy http 3000 --subdomain checkout --server https://relay.example.com:55555
 
 ### Expose on a client's own domain
 
-Your client adds `app.client.com` → your server IP, then:
+Your client adds `app.client.com` → your server IP (and, when the relay runs
+with `--verify-key`, publishes the TXT record from
+`kproxy domain verify-token app.client.com`), then:
 
 ```sh
 kproxy http 3000 --domain app.client.com --server https://relay.example.com:55555
 # → https://app.client.com
+```
+
+### Protect a tunnel with basic auth / IP allowlist / size & time limits
+
+```sh
+kproxy http 3000 \
+  --basic-auth alice:s3cret \
+  --ip-allow 203.0.113.0/24,198.51.100.7 \
+  --max-request-size 1mb \
+  --request-timeout 30s
+# Everyone else sees 401; bodies over 1mb get 413; requests over 30s get 503.
 ```
 
 ### Expose an SSH server over TCP
@@ -287,6 +427,13 @@ kproxy tcp 3306 --server https://relay.example.com:55555
 # → tcp://relay.example.com:20004
 ```
 
+### Keep a fixed public port (port pinning)
+
+```sh
+kproxy tcp 3306 --port 2200 --server https://relay.example.com:55555
+# → tcp://relay.example.com:2200   (fails if 2200 is already taken)
+```
+
 ### WebSockets over HTTP tunnel
 
 No special flag — a WebSocket app on your local server just works:
@@ -298,9 +445,28 @@ kproxy http 8080 --subdomain live --server https://relay.example.com:55555
 
 ### Multiple tunnels from one agent
 
+Define them all in a tunnel file and start one process:
+
 ```sh
-# run several kproxy commands in parallel, or see the roadmap for a
-# tunnel-config-file to start them all at once
+$ cat tunnels.json
+{
+  "tunnels": [
+    {"proto": "http", "local": "8082", "subdomain": "api"},
+    {"proto": "http", "local": "3000"},
+    {"proto": "tcp",  "local": "127.0.0.1:3306", "port": 2200}
+  ]
+}
+
+$ kproxy tunnels -f tunnels.json --server https://relay.example.com:55555
+Tunnel online on relay.example.com
+  https://api.relay.example.com
+  https://8f2ac1d4.relay.example.com
+  tcp://relay.example.com:2200
+```
+
+Running several commands in parallel also works:
+
+```sh
 kproxy http 8082 --subdomain api &
 kproxy tcp 3306 &
 ```
@@ -328,7 +494,40 @@ The file is created with restrictive permissions (`0600`). A custom location
 can be passed with `--config`.
 
 **Precedence** (first match wins): command-line flag → environment variable →
-config file → default / interactive prompt.
+config file → tunnel file (`server_url`/`api_key`) → default / interactive
+prompt.
+
+### Tunnel config file
+
+`kproxy tunnels -f FILE` reads a JSON file describing one or more tunnels:
+
+```json
+{
+  "server_url": "https://relay.example.com:55555",
+  "api_key": "your-secret-key",
+  "tunnels": [
+    {"proto": "http", "local": "8082", "subdomain": "api"},
+    {"proto": "http", "local": "127.0.0.1:3000"},
+    {"proto": "tcp",  "local": "3306", "port": 2200},
+    {"proto": "http", "local": "9090", "domain": "app.client.com"}
+  ]
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `server_url` | no | Relay server; falls back to flag/env/config/default |
+| `api_key` | no | API key; falls back to flag/env/config, else prompts |
+| `proto` | yes | `http` or `tcp` |
+| `local` | yes | Local target. A bare port number means `127.0.0.1:<port>` |
+| `port` | no | Fixed public TCP port (`tcp` only; auto-allocated if omitted) |
+| `subdomain` | no | Requested subdomain (HTTP only) |
+| `domain` | no | Custom domain (HTTP only) |
+| `basic_auth` | no | `user:pass` HTTP Basic auth for the tunnel (HTTP only) |
+| `ip_allow` | no | IP/CIDR allowlist (HTTP/TCP); empty admits everyone not denied |
+| `ip_deny` | no | IP/CIDR denylist (HTTP/TCP); deny wins over allow |
+| `max_request_size` | no | Request body cap, e.g. `1mb` (HTTP only); oversized → `413` |
+| `request_timeout` | no | Request duration bound, e.g. `30s` (HTTP only); timed out → `503` |
 
 On the **first run without `--api-key`**, kproxy prompts interactively and
 saves what you enter, so subsequent runs need no credentials:
@@ -374,8 +573,9 @@ is also wrapped in TLS, so agents can connect with
 ### Dev mode (no TLS)
 
 ```sh
-kproxyd --domain localhost --http-addr :8080 --https-addr "" --admin-key test
-kproxy http 8082 --server http://localhost:55555 --api-key test
+kproxyd --domain localhost --http-addr :8080 --https-addr "" --admin-key test --data-dir ./data
+kproxy key create --name dev --admin-key test        # once; prints a kproxy_ secret
+kproxy http 8082 --server http://localhost:55555 --api-key kproxy_...
 ```
 
 Public URLs look like `http://7f3a9c21.localhost:8080`. To test from a browser
@@ -384,23 +584,55 @@ so `*.yourdomain` reaches your machine.
 
 ---
 
+## Domain verification
+
+By default **any** key can claim any custom domain (subject to the key's
+`--subdomain` allowlist). If you run a shared relay, set `--verify-key` on the
+server so a custom domain is only honored once the requester proves they own
+it:
+
+```sh
+kproxyd --domain yourdomain.com ... --verify-key "a-secret-known-only-to-the-operator"
+```
+
+1. The operator fetches the token for the domain the client wants to use:
+
+   ```sh
+   kproxy domain verify-token app.client.com --admin-key "operator-secret"
+   # publish TXT  _kproxy.app.client.com  "kproxy-verify-1a2b3c4d"
+   ```
+
+2. The domain owner adds that TXT record at `_kproxy.app.client.com`.
+3. When an agent requests `--domain app.client.com`, the server checks the TXT
+   record; matching tokens are cached and the domain is honored.
+
+Domains without a matching record are refused with the exact value to publish,
+so the requester can fix their DNS and retry. Verification only applies to
+custom domains; hash and custom subdomains are unaffected. Tokens are derived
+from the domain and `--verify-key`, so `verify-token` needs no network round
+trip and always returns the same value for a given domain.
+
+---
+
 ## Security model
 
 | Concern | Approach |
-|---|---|
-| Agent authentication | API key / shared `--admin-key` verified on every registration. |
-| Key storage | Per-user config file, `0600` permissions; OS keyring planned. |
+|---|---|---|
+| Agent authentication | Per-user API keys; secrets hashed with argon2id, plaintext shown once at issuance. |
+| Key storage | `keys.json` in `--data-dir` (`0600`): argon2id hashes + sha256 lookup fingerprints; secrets are never stored. |
+| Admin access | Loopback-only admin API (`127.0.0.1:55556` by default) guarded by `--admin-key`. |
+| Abuse limiting | Per-key request rate (429), bandwidth pacing (both directions), and allowed-subdomain allowlists. |
+| Per-tunnel protection | HTTP Basic auth, IP allow/deny lists, request body caps (413) and request timeouts (503), all enforced server-side. |
+| Custom-domain control | DNS TXT verification (`--verify-key`) proves a domain owner before a custom domain is honored. |
 | Public endpoints | HTTPS with auto-rotating LetsEncrypt certs or your own certs. |
 | Transport | Control connections optionally TLS; tunnel traffic rides that encrypted channel. |
 | TLS version | Minimum TLS 1.2. |
 | Local exposure | The agent dials the local service; nothing is ever exposed inbound on the dev machine. |
-| Server hardening | Firewall the control port (`:55555`) to only your agents; keep `--admin-key` strong. |
+| Server hardening | Firewall the control port (`:55555`) to only your agents; keep `--admin-key` strong; bind `--admin-addr` to loopback. |
 
-**Before Phase 3** (real per-user API keys), `--admin-key` is a single shared
-secret. Do not run the server with `--admin-key ""` on a public network.
-
-Planned hardening: per-user API keys with hashing and expiry, per-key rate and
-bandwidth limits, per-tunnel basic auth and IP allowlists — see the roadmap.
+Keys with no limits configured are effectively unlimited except for expiry
+and revocation. Do not run the server without an admin key or with the admin
+API on a public interface.
 
 ---
 
@@ -457,8 +689,35 @@ sudo systemctl enable --now kproxyd
 
 ### Docker
 
-A multi-arch Docker image is planned (Phase 6). Until then, run the static
-binary directly on the host or in a scratch container.
+A multi-arch Docker image is built from `packaging/Dockerfile`:
+
+```sh
+make docker                          # docker build -t kproxyd:latest .
+docker run -d --name kproxyd --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 55555:55555 \
+  -v kproxyd-data:/var/lib/kproxy \
+  kproxyd:latest \
+  --domain yourdomain.com --acme-email you@example.com --admin-key "choose-a-strong-secret"
+```
+
+The image runs as a non-root user with CA certificates and the data directory
+on a volume; pass the same flags as the bare binary.
+
+### One-command bootstrap (Linux + systemd)
+
+The quickest way to stand up a server on a fresh VPS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kkennymore/kproxy/main/packaging/install-kproxyd.sh | sudo sh
+```
+
+This downloads the latest release, installs `kproxy`/`kproxyd` to
+`/usr/local/bin`, writes a config template to `/etc/kproxy/kproxyd.env`,
+installs a hardened systemd unit (with `CAP_NET_BIND_SERVICE` for ports
+80/443) and starts the service. Edit `/etc/kproxy/kproxyd.env`, then
+`systemctl restart kproxyd`.
+
+The packaged `.deb`/`.rpm` do the same for package-managed systems.
 
 ---
 
@@ -472,7 +731,10 @@ code layout, testing, and how to extend kproxy.
 Quick commands:
 
 ```sh
-make build    # build both binaries into bin/
+make build    # build both binaries into bin/ (rebuilds the embedded dashboard)
+make web      # rebuild the embedded dashboard from web/ (requires node/npm)
+make dist     # build all release artifacts locally via GoReleaser (needs goreleaser)
+make docker   # build the kproxyd Docker image (needs docker)
 make test     # run all unit + integration tests
 make race     # tests under the race detector (requires gcc)
 make vet      # go vet
@@ -482,15 +744,21 @@ make vet      # go vet
 
 ## Status and roadmap
 
-Implemented (Phases 0–1): protocol & multiplexer, HTTP + TCP tunnels, hash /
-custom subdomains, custom domains, WebSocket upgrades, reconnection with
-backoff, keepalives, TLS via ACME or static certs, admin-key auth, agent
-config persistence, JSON logs, CI, full test suite, cross-platform Go build.
+Implemented (Phases 0–6): protocol & multiplexer, HTTP + TCP tunnels,
+hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
+config files, WebSocket upgrades, reconnection with backoff, keepalives,
+graceful tunnel close + auto-recovery on local-app failure, per-user API keys
+(argon2id hashes, expiry, revocation, admin API) with per-key rate,
+bandwidth and allowed-subdomain limits, per-tunnel basic auth, IP
+allow/deny lists, request body caps and timeouts, request IDs, DNS TXT
+custom-domain verification, versioned control API (`/api/v1/...`), live
+tunnel list + real-time request inspector + key CRUD in an embedded web
+dashboard, TLS via ACME or static certs, agent config persistence, JSON
+logs, CI, full test suite, cross-platform build, packaging (GoReleaser
+archives + deb/rpm + Windows MSI, systemd unit, Docker image, one-command
+bootstrap script).
 
-Planned: multi-tunnel ergonomics and port pinning (2), real API-key store with
-hashing, expiry and limits (3), web dashboard (4), per-tunnel auth and IP
-allowlists (5), installers & packaging (6), metrics, load-balancing tunnels,
-flow control (7).
+Planned: metrics, load-balancing tunnels, flow control (7).
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full phased plan.
 

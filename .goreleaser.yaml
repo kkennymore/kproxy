@@ -1,0 +1,83 @@
+version: 2
+
+project_name: kproxy
+
+before:
+  hooks:
+    - npm --prefix web run build
+    - go run ./internal/buildtool -clean web/dist internal/server/dashboard
+
+env:
+  - CGO_ENABLED=0
+
+builds:
+  - id: kproxy
+    main: ./cmd/kproxy
+    binary: kproxy
+    ldflags:
+      - >-
+        -s -w
+        -X kproxy/internal/version.Version={{.Version}}
+        -X kproxy/internal/version.Commit={{.Commit}}
+        -X kproxy/internal/version.Date={{.Date}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+  - id: kproxyd
+    main: ./cmd/kproxyd
+    binary: kproxyd
+    ldflags:
+      - >-
+        -s -w
+        -X kproxy/internal/version.Version={{.Version}}
+        -X kproxy/internal/version.Commit={{.Commit}}
+        -X kproxy/internal/version.Date={{.Date}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+      - goos: darwin
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+nfpms:
+  - id: kproxyd
+    package_name: kproxyd
+    ids: [kproxyd]
+    vendor: kproxy
+    homepage: https://github.com/kkennymore/kproxy
+    maintainer: Usiobaifo Kenneth <kennethusiobaifo@yahoo.com>
+    description: |-
+      kproxy relay server.
+
+      Exposes local services through public tunnels: run kproxyd on a VPS
+      with a public IP and kproxy on your dev machine to tunnel HTTP and TCP
+      traffic out through a single persistent connection.
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    contents:
+      - src: ./packaging/kproxyd.service
+        dst: /lib/systemd/system/kproxyd.service
+      - src: ./LICENSE
+        dst: /usr/share/doc/kproxyd/LICENSE
+    scripts:
+      postinstall: ./packaging/scripts/postinstall.sh
+      postremove: ./packaging/scripts/postremove.sh
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

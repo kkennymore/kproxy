@@ -8,9 +8,12 @@ import (
 // Control message types. The Type field on each JSON payload disambiguates
 // the frame.
 const (
-	TypeHello   = "hello"
-	TypeWelcome = "welcome"
-	TypeError   = "error"
+	TypeHello    = "hello"
+	TypeWelcome  = "welcome"
+	TypeClose    = "close"
+	TypeAdd      = "add"
+	TypeAssigned = "assigned"
+	TypeError    = "error"
 )
 
 var ErrProtocol = errors.New("protocol: control error")
@@ -29,6 +32,22 @@ type TunnelSpec struct {
 	Local     string `json:"local"`
 	Subdomain string `json:"subdomain,omitempty"`
 	Domain    string `json:"domain,omitempty"`
+	// Port requests a specific public TCP port for ProtoTCP tunnels. Zero
+	// means the server allocates one from its range.
+	Port int `json:"port,omitempty"`
+	// BasicAuth protects an HTTP tunnel with HTTP Basic auth ("user:pass").
+	BasicAuth string `json:"basic_auth,omitempty"`
+	// IPAllow and IPDeny are comma-separated IP/CIDR allow and deny lists
+	// applied to public client connections. Deny wins over allow; an empty
+	// allow list admits everyone not denied.
+	IPAllow []string `json:"ip_allow,omitempty"`
+	IPDeny  []string `json:"ip_deny,omitempty"`
+	// MaxRequestSize caps an HTTP request body, e.g. "1mb". Empty is
+	// unlimited.
+	MaxRequestSize string `json:"max_request_size,omitempty"`
+	// RequestTimeout bounds how long an HTTP request may take, e.g. "30s".
+	// Empty means no timeout.
+	RequestTimeout string `json:"request_timeout,omitempty"`
 }
 
 // Hello is the first control message an agent sends when it connects.
@@ -57,6 +76,27 @@ type Welcome struct {
 type ErrorMsg struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+}
+
+// CloseMsg requests the server to unregister tunnels by ID. Unknown IDs are
+// ignored. Sent by the agent on exit and when a local target fails.
+type CloseMsg struct {
+	Type    string   `json:"type"`
+	Tunnels []string `json:"tunnels"`
+}
+
+// AddMsg requests the server to open additional tunnels on an already
+// registered connection, e.g. after a local target recovers. Tunnel IDs must
+// not collide with already-registered ones.
+type AddMsg struct {
+	Type    string       `json:"type"`
+	Tunnels []TunnelSpec `json:"tunnels"`
+}
+
+// AssignedMsg is the server's reply to an AddMsg.
+type AssignedMsg struct {
+	Type    string         `json:"type"`
+	Tunnels []TunnelAssign `json:"tunnels"`
 }
 
 // MarshalControl encodes a control message payload.

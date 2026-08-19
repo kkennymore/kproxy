@@ -99,29 +99,46 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 .
 ├── cmd/
 │   ├── kproxy/                 agent CLI (subcommands, flags, first-run prompt)
-│   └── kproxyd/                relay daemon (listeners, TLS/ACME, shutdown)
+│   └── kproxyd/                relay daemon (listeners, TLS/ACME, admin API)
 ├── internal/
+│   ├── admin/                  admin HTTP API client (the CLI uses /api/v1)
 │   ├── agent/                  agent control loop, reconnect/backoff, accept loop
+│   ├── auth/                   argon2id hashing + secret generation
 │   ├── config/                 agent config file persistence
 │   ├── protocol/               wire framing, stream multiplexer, control msgs
-│   ├── relay/                  server registry, host/port allocation, routing
+│   ├── ratelimit/              stdlib token buckets (rate / bandwidth pacing)
+│   ├── relay/                  server registry, host/port allocation, routing, events
+│   ├── server/                 control-plane API + embedded dashboard (go:embed)
+│   ├── store/                  JSON-file-backed api key store
+│   ├── units/                  size / duration parsing shared by admin + relay
 │   └── version/                version/commit injection
+├── web/                        React + Vite dashboard source (built into internal/server/dashboard)
 ├── examples/demo/              tiny web app for manual smoke tests
+├── packaging/                  Dockerfile, systemd unit, MSI wxs + builder, bootstrap script
 ├── docs/
 │   ├── architecture.md         high-level design & deployment notes
 │   └── roadmap.md              phased plan
-├── .github/workflows/ci.yml    CI matrix (vet + race test + build, 3 OSes)
-├── Makefile                    build/test/vet/race targets
+├── .github/workflows/ci.yml    CI matrix (vet + race test + build, 3 OSes) + installer smoke
+├── .github/workflows/release.yml  GoReleaser release on tags + MSI build/upload
+├── .goreleaser.yaml            release pipeline (builds, archives, deb/rpm)
+├── Makefile                    build/test/vet/race/dist/docker targets
 ├── go.mod / go.sum             module definition
+├── LICENSE                     MIT
 └── README.md                   end-user documentation
 ```
 
 | Package | Responsibility | Key types |
 |---|---|---|
 | `protocol` | Wire format, multiplexing, byte bridge | `Mux`, `Stream`, `FrameType`, `Hello`/`Welcome`/`ErrorMsg` |
-| `relay` | Server-side tunnel bookkeeping and routing | `Server`, `client`, `tunnel` |
+| `relay` | Server-side tunnel bookkeeping, routing and events | `Server`, `client`, `tunnel`, `KeyValidator`, `Event`/`TunnelInfo`/`RequestInfo` |
 | `agent` | Client-side lifecycle and bridging | `Agent` |
+| `auth` | Argon2id hashing and secret generation | — |
+| `store` | Api key persistence and validation | `Store`, `KeyInfo`, `KeyIdentity`, `Limits` |
+| `ratelimit` | Token-bucket rate/bandwidth limits | `Bucket` |
+| `admin` | Admin HTTP API client used by the CLI | `CreateKey`, `ListKeys`, `RevokeKey` |
+| `server` | Versioned control API + SSE + embedded dashboard | `NewHandler`, `handleStream` |
 | `config` | Config file read/write | `AgentConfig` |
+| `units` | Size/duration parsing (`ParseSize`, `ParseTTL`) | — |
 
 ---
 
@@ -167,10 +184,19 @@ Control frames flow over stream id 0 and carry one of these payloads:
   "version": "0.1.0",
   "api_key": "secret",
   "tunnels": [
-    {"id": "main", "proto": "http", "local": "127.0.0.1:8082", "subdomain": "", "domain": ""}
+    {"id": "main", "proto": "http", "local": "127.0.0.1:8082", "subdomain": "api", "domain": ""},
+    {"id": "db", "proto": "tcp", "local": "127.0.0.1:3306", "port": 2200}
   ]
 }
 ```
+
+`TunnelSpec` fields (see `internal/protocol/control.go`): `id`, `proto`
+(`http`/`tcp`), `local`, `subdomain`, `domain`, `port` (a fixed public TCP
+port; `0`/omitted means auto-allocate from the range), and the Phase 5
+security options — `basic_auth` (`user:pass`), `ip_allow`/`ip_deny` (IP/CIDR
+lists), `max_request_size` (e.g. `1mb`), `request_timeout` (e.g. `30s`). The
+relay re-parses and validates these server-side in `applySpecOptions`; the
+agent never gets to enforce them.
 
 **`welcome`** (server → agent, success reply):
 
@@ -183,15 +209,40 @@ Control frames flow over stream id 0 and carry one of these payloads:
 }
 ```
 
-**`error`** (server → agent, fatal handshake failure):
+**`error`** (server → agent, fatal handshake failure or post-registration
+rejection):
 
 ```json
 {"type": "error", "message": "invalid api key"}
 ```
 
+**`close`** (agent → server, graceful tunnel teardown):
+
+```json
+{"type": "close", "tunnels": ["main", "db"]}
+```
+
+The server unregisters the listed tunnels immediately, freeing their hosts and
+TCP listeners. Unknown IDs are ignored. Sent on agent exit and when a local
+target goes down.
+
+**`add`** (agent → server, open more tunnels after registration):
+
+```json
+{"type": "add", "tunnels": [{"id": "db", "proto": "tcp", "local": "127.0.0.1:3306", "port": 2200}]}
+```
+
+Used to reopen a tunnel whose local target recovered. The server replies with:
+
+**`assigned`** (server → agent, reply to `add`):
+
+```json
+{"type": "assigned", "tunnels": [{"id": "db", "public_url": "tcp://example.com:2200"}]}
+```
+
 The `type` field disambiguates; the wire types are defined in
-`internal/protocol/control.go` (`TypeHello`, `TypeWelcome`, `TypeError`,
-`ProtoHTTP`, `ProtoTCP`).
+`internal/protocol/control.go` (`TypeHello`, `TypeWelcome`, `TypeClose`,
+`TypeAdd`, `TypeAssigned`, `TypeError`, `ProtoHTTP`, `ProtoTCP`).
 
 ### Stream lifecycle
 
@@ -285,8 +336,10 @@ Upgrade requests (any `Connection: upgrade`) take a different path
 
 ### A TCP tunnel
 
-1. The server binds a public port (range `20000–29999` by default) at
-   registration and starts an accept loop.
+1. The server binds a public port at registration and starts an accept loop.
+   A requested port (`spec.Port`) is honored exactly when free; otherwise a
+   port is picked from the configured range (`20000–29999` by default) by
+   `allocateTCPPortLocked`.
 2. Each accepted client connection is handed a fresh stream and bridged with
    `protocol.Bridge`; the agent dials the local TCP target on the other side.
 3. When either end closes, the bridge closes the other end and the stream.
@@ -298,6 +351,24 @@ Upgrade requests (any `Connection: upgrade`) take a different path
    ports, and closes TCP listeners; the agent tears down streams.
 3. The agent's `Run` loop waits `backoff` (1 s, doubling to a 30 s cap), dials
    again, and re-registers the same tunnels. Clients simply reconnect.
+
+### Graceful close on agent exit
+
+`Agent.Close()` (or the `Run` ctx-cancel path) sends a `close` control message
+for every tunnel before tearing down the mux, so the server releases the
+endpoints immediately instead of waiting for the keepalive-dead timeout.
+
+### Local-target health & auto-recovery
+
+The agent runs a `healthLoop` that probes each configured local target every
+`HealthEvery` (default 5 s, 2 s dial timeout). Consecutive dial failures — from
+probes or from stream dials — are counted per tunnel (`tracker`); after
+`LocalFailThreshold` (default 3) failures while the tunnel was healthy, the
+agent sends `close` for that tunnel and the server frees its endpoint. Once the
+target answers again, the agent sends `add` and the server re-assigns a public
+URL (`assigned` reply → `OnAssigned` callback). For random-hash HTTP tunnels
+the reopened URL is a new random host; pinned TCP ports are rebound to the same
+port.
 
 ---
 
@@ -357,7 +428,14 @@ Written with mode `0600`, directories `0700`. `internal/config` exposes
 1. Command-line flags
 2. Environment variables (`KPROXY_SERVER`, `KPROXY_API_KEY`)
 3. Config file
-4. Defaults or the interactive first-run prompt
+4. Tunnel file `server_url`/`api_key` (for `kproxy tunnels -f FILE`)
+5. Defaults or the interactive first-run prompt
+
+The tunnel config file (`config.LoadTunnelFile`, parsed into specs by
+`specsFromFile`) defines `proto`/`local`/`port`/`subdomain`/`domain` per
+tunnel plus the security options `basic_auth`/`ip_allow`/`ip_deny`/
+`max_request_size`/`request_timeout`; `local` may be a bare port number
+meaning `127.0.0.1:<port>`.
 
 ### CLI parsing
 
@@ -380,16 +458,73 @@ moved ahead of positionals (while keeping flag/value pairs together via the
 
 ## 8. Security internals
 
-- **Authentication:** the agent sends `api_key` in its hello; the server
-  compares it to the configured `--admin-key`. An empty admin key disables the
-  check (dev only). Phase 3 replaces this with per-user hashed API keys.
+- **Agent authentication:** the agent sends `api_key` in its hello; the relay
+  delegates validation to a `KeyValidator` (the `store.Store` in production).
+  Keys are argon2id-hashed (`internal/auth`) with a sha256 fingerprint as an
+  O(1) lookup index; `ValidateKey` rejects unknown, revoked and expired keys
+  and returns the key's `KeyIdentity` (ID + `Limits`) for per-key policy.
+  A `nil` validator disables the check (relay tests, dev).
+- **Per-key limits:** `internal/ratelimit` is a stdlib token bucket used in two
+  places — a request-rate bucket checked in `serveHTTP` (excess requests get
+  `429` with `Retry-After`) and a bandwidth bucket that paces tunnel bytes in
+  both directions (`pacedConn`/`pacedWriter` wrap the stream and the client
+  response writer). Limits live on `store.Limits` and travel with the agent's
+  `KeyIdentity`. Allowed-subdomain lists are enforced at registration in
+  `checkSubdomainAllowed` (claimed subdomains and custom domains must be in the
+  list; random-hash hosts are always allowed).
+- **Per-tunnel protection (Phase 5):** set by the agent on the tunnel spec,
+  enforced by the relay. `applySpecOptions` re-parses `basic_auth`,
+  `ip_allow`/`ip_deny` (`parseIPNets`, deny wins), `max_request_size`
+  (`units.ParseSize`) and `request_timeout` (`units.ParseTTL`) and rejects
+  HTTP-only options on TCP tunnels. Enforcement: Basic auth in `serveHTTP`
+  (`401` + `WWW-Authenticate`, constant-time compare); IP checks on every HTTP
+  request and on TCP connects (`remoteIP` handles `host:port`); request bodies
+  capped via a known-length pre-check and a `sizeLimited` wrapper for
+  chunked/unknown bodies — when the cap trips, `http.Request.Write` wraps the
+  sentinel in Go's unexported `requestBodyReadError`, so detection falls back
+  to a message comparison in `isBodyTooLarge` and the client gets `413`;
+  durations bounded with `http.TimeoutHandler` (`503`). Every proxied request
+  gets an `X-Request-Id` (`newID(8)`) echoed on responses, upgrades and the
+  live `request` event.
+- **Custom-domain verification (Phase 5):** enabled by `kproxyd --verify-key`.
+  `verifyToken(key, domain)` derives `kproxy-verify-` + hex(sha256(`domain|key`)[:8])
+  so tokens are deterministic and offline. `kproxy domain verify-token HOST`
+  fetches one over the control API (`GET /api/v1/domains/{domain}/token`,
+  `503` when disabled). Registration runs `verifyCustomDomains` *outside* the
+  server lock: it queries TXT `_kproxy.<host>` via an injectable `TXTLookup`
+  (nil → `net.DefaultResolver`, 5 s timeout), caches verified hosts in
+  `Server.verified`, and refuses domains whose records don't match — an
+  NXDOMAIN or wrong value returns the exact TXT record to publish.
+- **Admin API:** the versioned control API lives in `internal/server` and is
+  served on the loopback admin listener (`--admin-addr`) together with the
+  embedded dashboard. `internal/admin` now holds the *client* that the CLI uses.
+  Requests are authenticated with `--admin-key` (Bearer header or `?token=` for
+  the SSE stream) compared in constant time. Requests without an admin key get
+  401; an empty `--admin-key` disables the API (503).
+- **Control API + dashboard:** `internal/server.NewHandler(srv, store, adminKey)`
+  serves `GET /api/v1/tunnels` (live snapshot from `relay.Server.Tunnels()`),
+  `GET /api/v1/tunnels/stream` (SSE: `tunnel_open`/`tunnel_close`/`request`
+  events from `relay.Server.Subscribe()` with a 15 s heartbeat),
+  `GET /api/v1/status` (aggregate from `relay.Server.Status()`),
+  `GET /api/v1/domains/{domain}/token` (DNS TXT verification token), and key
+  CRUD proxied to the store. The dashboard is the built React/Vite app in
+  `internal/server/dashboard` embedded with `//go:embed`; rebuild via
+  `make web`. The admin CLI is just another client of the same `/api/v1/*`
+  routes.
+- **Relay events:** `relay.Server` publishes to buffered subscribers
+  (`Subscribe()`), non-blocking — slow consumers drop events rather than stall
+  the relay. `request` events are emitted from `proxy()` after proxying
+  (status + bytes captured via a `statusWriter`); 101 upgrades emit their event
+  before bridging. Tunnel open/close events carry a `TunnelInfo` snapshot.
 - **TLS:** the public HTTPS listener uses either the ACME manager
   (`golang.org/x/crypto/acme/autocert`, `--acme-email`) or static certificates
   (`--tls-cert`/`--tls-key`). `MinVersion` is TLS 1.2. With static certs the
   control listener is also wrapped in TLS so agents connect via `https://`.
 - **ACME host policy:** the autocert manager only issues for the configured
   base domain and its subdomains; every other host is rejected.
-- **Randomness:** subdomain hashes use `crypto/rand`.
+- **Randomness:** subdomain hashes and api key secrets use `crypto/rand`.
+  Secrets are 128-bit random values with a `kproxy_` prefix and are returned
+  exactly once at issuance.
 - **Local exposure:** the agent dials localhost only; the dev machine never
   opens an inbound port.
 - **Log hygiene:** logs include agent/tunnel identifiers but never the api key.
@@ -421,17 +556,91 @@ Spin up a real `relay.Server` with HTTP + control listeners and a real
 - custom subdomain allocation
 - custom domain allocation
 - TCP tunnel end-to-end (byte echo through the public port)
+- **TCP port pinning** — a requested public port is honored
+- **pinned-port conflict** — an occupied port is rejected with an error
+- **multi-tunnel** — one agent registering HTTP + TCP tunnels in a single hello
+- **close/add round-trip** — a raw agent unregisters tunnels (`close`) freeing
+  hosts/ports, then reopens them (`add`) and gets fresh assignments
+- **local-target failure & recovery** — the agent closes a TCP tunnel when its
+  local target dies and reopens it on the same pinned port when it recovers
 - **WebSocket upgrade** end-to-end (raw 101 handshake + frame echo)
 - handshake rejection with a bad api key
+- **store-backed auth** — real `store.Store` validates an agent key; a bad key
+  is rejected with no reconnect loop
+- **subdomain restriction** — a key limited to `["api"]` is welcomed on `api`
+  and rejected with `subdomain ... not allowed` on any other
+- **request rate limit** — a key at 1 req/s serves 200 then 429
+- **relay events** — `Subscribe()` receives `tunnel_open` (with the assigned
+  public URL), `request` (path/status for a proxied request) and `tunnel_close`
+  as the agent connects and exits
+- **basic auth** — a tunnel with `--basic-auth` returns 401 + `WWW-Authenticate`
+  without credentials and proxies with the correct ones
+- **IP allow/deny** — CIDR allow/deny lists admit and reject clients by remote
+  IP; deny wins; a bad CIDR is rejected at registration
+- **request size limit** — known-length and chunked bodies over the cap get
+  413; bodies under it pass
+- **request timeout** — a slow app gets 503 `request timed out`
+- **request ID** — `X-Request-Id` flows on the request, response and 101
+  upgrade, and shows up in the `request` event
+- **per-tunnel counters** — requests/bytes accumulate on `TunnelInfo` and are
+  surfaced by `Server.Status()`
+- **invalid tunnel options** — malformed basic-auth/IP/size/timeout values and
+  HTTP-only options on TCP tunnels are rejected at registration
+- **domain verification** — with a fake `TXTLookup`, a verified custom domain
+  is honored (cached), an unverified/NXDOMAIN one is rejected with the TXT
+  value to publish, and a server without `--verify-key` returns no token
 
 The `testEnv` harness builds a server on ephemeral ports and registers cleanup
 with `t.Cleanup`, so tests are hermetic and parallel-safe.
+
+### Control-plane tests — `internal/server/server_test.go`
+
+Exercise the embedded dashboard handler end-to-end over HTTP with a real relay
++ agent:
+
+- 401 on unauthenticated control requests
+- empty tunnel list, then a populated one after an agent connects
+- key CRUD over `/api/v1/keys` (Authorization bearer)
+- `GET /api/v1/status` returns aggregate relay stats (uptime/tunnels/agents/
+  request & byte totals) and 401 without auth
+- `GET /api/v1/domains/{domain}/token` issues a stable `kproxy-verify-` token
+  when verification is enabled and 503 when it is disabled
+- SSE stream (`?token=` auth): `text/event-stream` content type and a live
+  `request` event flowing through the stream when a request hits the tunnel
+
+### CLI tests — `cmd/kproxy/main_test.go`
+
+- `reorderFlagArgs` moves flags ahead of positionals, keeping value-taking
+  flags paired (`--subdomain myapp`) and `--flag=value` intact
+- `specsFromFile` converts a tunnel file into specs (bare-port `local`
+  shorthand, `port`, `domain`, and the security fields `basic_auth`/
+  `ip_allow`/`ip_deny`/`max_request_size`/`request_timeout`)
+- tunnel-file validation errors (no tunnels, bad proto, bad local, bad port)
 
 ### Config tests — `internal/config/config_test.go`
 
 - save/load round trip through a temp path
 - permission check (POSIX only)
 - missing-file → empty config
+
+### Auth / store / admin / ratelimit / units tests
+
+- `internal/auth`: hash→verify round trip, wrong-secret rejection, salted
+  hashes, malformed PHC rejection, secret shape
+- `internal/store`: create/validate/revoke/expiry, persistence across reloads,
+  newest-first listing, secrets never written to the file, limits round-trip
+  through the file and into `ValidateKey`'s `KeyIdentity`
+- `internal/ratelimit`: take/refill, pacing, large `Wait` beyond the burst,
+  unlimited bucket
+- `internal/admin`: create/list/revoke over HTTP with auth (401/503/404 paths),
+  `ParseTTL` (`d`/`w` suffixes), `ParseSize` (`kb`/`mb`/`gb`), limits round-trip,
+  bad size rejected
+- `internal/units`: `ParseSize` (`b`/`kb`/`mb`/`gb`, bad input) and `ParseTTL`
+  (`ms`/`s`/`m`/`h`/`d`/`w`)
+- `internal/protocol`: `TunnelSpec` JSON round-trip preserves the security
+  fields and omits them when empty
+- `cmd/kproxy` `key` subcommands against a real admin handler (create → list →
+  revoke → validation fails; bad admin key → unauthorized)
 
 ### Manual smoke test (CLI end-to-end)
 
@@ -446,9 +655,10 @@ go build -o bin/kproxyd ./cmd/kproxyd
 ./bin/kproxyd --domain kproxy.test --http-addr 127.0.0.1:8080 \
   --https-addr "" --control-addr 127.0.0.1:55555 --admin-key test
 
-# terminal 3: agent
+# terminal 3: issue an agent key, then start the agent
 go build -o bin/kproxy ./cmd/kproxy
-./bin/kproxy http 8082 --server http://localhost:55555 --api-key test
+./bin/kproxy key create --name dev --admin-url http://127.0.0.1:55556 --admin-key test
+./bin/kproxy http 8082 --server http://localhost:55555 --api-key kproxy_...
 
 # terminal 4: hit the assigned host (DNS not needed — set Host header)
 curl -H "Host: <hash>.kproxy.test" http://127.0.0.1:8080/
@@ -457,22 +667,34 @@ curl -H "Host: <hash>.kproxy.test" http://127.0.0.1:8080/
 ### CI
 
 `.github/workflows/ci.yml` runs on push/PR across **ubuntu, windows, macos**:
-`go vet`, `go test -race -count=1 ./...`, and `go build ./cmd/...`. The race
-detector needs a C compiler, which all three runners provide.
+`go vet`, `go test -race -count=1 ./...`, `go build ./cmd/...`, and a portable
+dashboard build. A `package` job runs a GoReleaser snapshot and a `smoke`
+job (same matrix) extracts each OS's native archive and runs
+`kproxy --version`/`kproxyd --version`, so every installer is exercised in
+CI. The race detector needs a C compiler, which all three runners provide.
 
 ---
 
 ## 10. Building & tooling
 
 ```sh
-make build      # builds bin/kproxy and bin/kproxyd
+make build      # builds bin/kproxy and bin/kproxyd (also rebuilds the dashboard)
+make web        # npm build of web/ and copy into internal/server/dashboard (needs node/npm)
 make build-agent / make build-server
+make dist       # GoReleaser snapshot: archives + deb/rpm for every platform (needs goreleaser)
+make docker     # docker build the relay image from packaging/Dockerfile (needs docker)
 make test       # go test ./...
 make race       # go test -race -count=1 ./...
 make vet        # go vet ./...
 make fmt        # gofmt -l -w cmd internal
 make clean
 ```
+
+The dashboard is a React + Vite app in `web/`. Its production build is copied
+into `internal/server/dashboard` (committed) and embedded via `//go:embed`, so
+plain `go build` needs no node toolchain. Change `web/`, run `make web`, and
+the server picks the new UI up on next build. For UI development run `npm run
+dev` in `web/` — Vite proxies `/api` to `http://127.0.0.1:55556`.
 
 Cross-compiling (works on any host):
 
@@ -491,6 +713,28 @@ Version stamping: build with `-ldflags` to inject `internal/version`:
 go build -ldflags "-X kproxy/internal/version.Commit=$(git rev-parse --short HEAD)"
 ```
 
+### Releases (GoReleaser)
+
+`.goreleaser.yaml` (v2) cross-compiles both binaries for
+linux/darwin/windows × amd64/arm64 with `CGO_ENABLED=0`, stamps version
+metadata via ldflags, and produces `.tar.gz`/`.zip` archives plus `.deb`/
+`.rpm` packages (`packaging/scripts/*` manage the systemd unit on
+install/remove). `internal/buildtool` handles the dashboard copy portably, so
+the `before` hook works on any runner. Snapshot locally with `make dist`;
+release on a tag via `.github/workflows/release.yml`.
+
+Windows MSIs are built from `packaging/windows/*.wxs` with the WiX v4+
+toolset (`dotnet tool install --global wix`) via `packaging/build-msi.ps1`;
+the release workflow builds them on a Windows runner and uploads them to the
+GitHub release.
+
+### Docker
+
+`packaging/Dockerfile` builds `kproxyd` in `golang:1.24-alpine` (the embedded
+dashboard is committed under `internal/server/dashboard`, so no node toolchain
+is needed at image build time) and runs on `alpine:3.20` as a non-root user
+with CA certificates and a `--data-dir` volume.
+
 ---
 
 ## 11. How to extend kproxy
@@ -507,17 +751,25 @@ go build -ldflags "-X kproxy/internal/version.Commit=$(git rev-parse --short HEA
 
 ### Add a control-plane API (dashboard / admin CLI)
 
-Phase 4 introduces a versioned REST surface (`/api/v1/...`) in a new
-`internal/server` package. Keep it a thin layer over `relay.Server` state and
-the future `internal/store`. The dashboard and admin CLI are just clients of
-that API.
+Implemented in Phase 4 as `internal/server`: a versioned REST surface
+(`/api/v1/...`) over `relay.Server` state and the key store, plus the embedded
+React/Vite dashboard (`web/` → `internal/server/dashboard` via `//go:embed`).
+The dashboard and admin CLI are just clients of that API. To add an endpoint:
+define the handler in `internal/server`, mount it on the versioned mux,
+publish any backing data as a relay `Event`, and add an admin test. The
+dashboard UI is plain React components in `web/src` that call the same routes.
 
 ### Add a key store / per-user API keys
 
-Phase 3: introduce `internal/store` backed by pure-Go SQLite
-(`modernc.org/sqlite`). Hash keys with argon2id from `golang.org/x/crypto`.
-Replace the single `adminKey` comparison in `relay.HandleAgent` with a lookup
-in the store.
+Implemented in Phase 3 as `internal/store` (atomic JSON file, stdlib-only,
+per the project's single-dependency rule) + `internal/auth` (argon2id) +
+`internal/admin` (loopback HTTP API). The relay's `AdminKey` was replaced by
+the `KeyValidator` interface; `cmd/kproxyd` wires the file store in. Per-key
+rate/bandwidth limits hook into `relay.serveHTTP`/the bridge via
+`internal/ratelimit` buckets built from the `KeyIdentity` returned during
+registration; allowed-subdomain lists are enforced in
+`checkSubdomainAllowed`. To extend: add fields to `store.key`/`KeyInfo`, expose
+them in `internal/admin`, and surface them in `kproxy key ...`.
 
 ### Add agent features
 
@@ -538,22 +790,23 @@ in the store.
 
 ## 12. Status & roadmap
 
-**Implemented:** protocol & multiplexer, HTTP + TCP tunnels, hash / custom
-subdomains, custom domains, WebSocket upgrades, reconnect with backoff,
-keepalives, TLS (ACME + static certs), admin-key auth, config persistence,
-JSON logs, CI, full test suite, cross-platform build.
+**Implemented (Phases 0–6):** protocol & multiplexer, HTTP + TCP tunnels,
+hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
+config files, WebSocket upgrades, reconnect with backoff, keepalives,
+graceful tunnel close + local-target auto-recovery, per-user API keys
+(argon2id hashing, expiry, revocation, loopback admin API) with per-key rate
+(429), bandwidth-pacing and allowed-subdomain limits, per-tunnel basic auth,
+IP allow/deny lists, request body caps (413) and timeouts (503), request IDs,
+DNS TXT custom-domain verification (`--verify-key` + `kproxy domain
+verify-token`), versioned control API (`/api/v1/*`), live tunnel list +
+real-time request inspector (SSE) + key CRUD in an embedded React dashboard,
+TLS (ACME + static certs), config persistence, JSON logs, CI, full test
+suite, cross-platform build, packaging (GoReleaser archives + deb/rpm +
+Windows MSI via WiX, systemd unit, Docker image, one-command bootstrap).
 
 **Planned (see [docs/roadmap.md](docs/roadmap.md)):**
 
-1. **Phase 2** — multi-tunnel ergonomics, TCP port pinning, tunnel config file.
-2. **Phase 3** — real API-key store (argon2id + SQLite), expiry, per-key
-   rate/bandwidth limits, admin CLI.
-3. **Phase 4** — web dashboard (React + Vite, embedded via `//go:embed`),
-   live request inspector, key CRUD.
-4. **Phase 5** — per-tunnel basic auth, IP allowlists, domain verification,
-   request limits.
-5. **Phase 6** — packaging: GoReleaser (deb/rpm/MSI/pkg/zip), systemd, Docker.
-6. **Phase 7** — hardening: Prometheus metrics, flow control, load-balanced
+1. **Phase 7** — hardening: Prometheus metrics, flow control, load-balanced
    tunnels, OS keyring, fuzzing.
 
 ---

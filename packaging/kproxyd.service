@@ -1,0 +1,29 @@
+[Unit]
+Description=kproxy relay server
+Documentation=https://github.com/kkennymore/kproxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Configure --domain, --acme-email (or --tls-cert/--tls-key) and --admin-key
+# in an EnvironmentFile, e.g. /etc/kproxy/kproxyd.env.
+EnvironmentFile=-/etc/kproxy/kproxyd.env
+ExecStart=/usr/bin/kproxyd --data-dir /var/lib/kproxy
+Restart=always
+RestartSec=3
+DynamicUser=yes
+StateDirectory=kproxy
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Allow binding privileged ports 80/443 as the dynamic user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ReadOnlyPaths=/usr/bin
+
+[Install]
+WantedBy=multi-user.target

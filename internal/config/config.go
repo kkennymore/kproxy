@@ -16,6 +16,46 @@ type AgentConfig struct {
 	APIKey    string `json:"api_key"`
 }
 
+// TunnelEntry is one tunnel inside a TunnelFile.
+type TunnelEntry struct {
+	Proto     string `json:"proto"`
+	Local     string `json:"local"`
+	Port      int    `json:"port,omitempty"`
+	Subdomain string `json:"subdomain,omitempty"`
+	Domain    string `json:"domain,omitempty"`
+	// Security options, all optional.
+	BasicAuth      string   `json:"basic_auth,omitempty"`
+	IPAllow        []string `json:"ip_allow,omitempty"`
+	IPDeny         []string `json:"ip_deny,omitempty"`
+	MaxRequestSize string   `json:"max_request_size,omitempty"`
+	RequestTimeout string   `json:"request_timeout,omitempty"`
+}
+
+// TunnelFile defines multiple tunnels to open from a single agent process.
+// The server and api_key fields are optional; CLI flags, environment
+// variables and the credential config file take precedence.
+type TunnelFile struct {
+	ServerURL string        `json:"server_url,omitempty"`
+	APIKey    string        `json:"api_key,omitempty"`
+	Tunnels   []TunnelEntry `json:"tunnels"`
+}
+
+// LoadTunnelFile reads a tunnel definition file.
+func LoadTunnelFile(path string) (TunnelFile, error) {
+	var tf TunnelFile
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return tf, err
+	}
+	if err := json.Unmarshal(b, &tf); err != nil {
+		return tf, err
+	}
+	if len(tf.Tunnels) == 0 {
+		return tf, errors.New("tunnel file must define at least one tunnel")
+	}
+	return tf, nil
+}
+
 // AgentPath returns the platform-appropriate config file path.
 func AgentPath() (string, error) {
 	dir, err := os.UserConfigDir()
