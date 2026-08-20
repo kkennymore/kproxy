@@ -152,6 +152,10 @@ For the full protocol and implementation details, see
 - **Single static binary** — no runtime dependencies, no installer cruft.
 - **Prometheus metrics** — `GET /metrics` on the admin listener exposes
   request/byte counters per tunnel, plus tunnel/agent/uptime/version gauges.
+- **Request logs & replay** — every proxied request is logged with redaction
+  (path only: query strings, headers and bodies are never captured), and the
+  most recent requests are kept in a bounded in-memory ring served by
+  `GET /api/v1/requests` and `kproxy requests`.
 - **Cross-platform** — Windows, Linux (deb/rpm), macOS; amd64 and arm64.
 - **Self-contained** — the only third-party dependency is Google's
   `x/crypto` (ACME client), pinned and vendored at build time.
@@ -273,6 +277,7 @@ kproxy http <port> [flags]     expose an HTTP service
 kproxy tcp <port>  [flags]     expose a raw TCP service
 kproxy tunnels -f FILE [flags] expose several tunnels from one process
 kproxy key <cmd> [flags]       manage api keys on the relay
+kproxy requests [flags]        show recent proxied requests from the relay log
 ```
 
 | Flag | Default | Description |
@@ -349,6 +354,27 @@ kproxy domain verify-token <host>  --admin-url URL --admin-key SECRET
 Prints the DNS TXT record to publish to prove you control `<host>` (see
 [Domain verification](#domain-verification)).
 
+#### Replaying recent requests
+
+```
+kproxy requests [--limit N]  --admin-url URL --admin-key SECRET
+```
+
+Prints the most recent proxied requests (newest first) from the relay's
+bounded in-memory replay log, e.g.:
+
+```sh
+kproxy requests --limit 10 --admin-key "operator-secret"
+# TIME                   METHOD HOST                     STATUS DURATION  BYTES PATH
+# 2026-08-19 10:42:07    GET    api.yourdomain.com           200    12ms  1024 /v1/users
+# 2026-08-19 10:41:58    POST   api.yourdomain.com           201   305ms 15360 /v1/orders
+```
+
+Only the URL **path** is recorded — query strings, headers and bodies are
+redacted, so secrets in URLs or requests never reach the log or the API. The
+same data is served by `GET /api/v1/requests` (admin Bearer auth, `?limit=`
+up to 1000). Retention is bounded by the server's `--request-log` size.
+
 ### kproxyd (relay server)
 
 ```
@@ -367,6 +393,7 @@ kproxyd --domain example.com [flags]
 | `--acme-email` | — | Email for LetsEncrypt; enables automatic certificates |
 | `--tls-cert` / `--tls-key` | — | Paths to your own certificate and private key |
 | `--verify-key` | — | Secret enabling custom-domain verification; when set, custom domains are only honored after their DNS TXT record matches |
+| `--request-log` | `1000` | Number of recent proxied requests kept for replay via `/api/v1/requests` (`0` disables) |
 | `--data-dir` | `./data` | Directory for the certificate cache, key store (`keys.json`) and runtime state |
 | `--verbose` | off | Debug-level logging |
 | `--json` | off | JSON log output |
@@ -798,7 +825,7 @@ make vet      # go vet
 
 ## Status and roadmap
 
-Implemented (Phases 0–7): protocol & multiplexer, HTTP + TCP tunnels,
+Implemented (Phases 0–8): protocol & multiplexer, HTTP + TCP tunnels,
 hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
 config files, WebSocket upgrades, reconnection with backoff, keepalives,
 graceful tunnel close + auto-recovery on local-app failure, per-user API keys
@@ -811,8 +838,9 @@ dashboard, TLS via ACME or static certs, agent config persistence, JSON
 logs, CI, full test suite, cross-platform build, packaging (GoReleaser
 archives + deb/rpm + Windows MSI, systemd unit, Docker image, one-command
 bootstrap script), Prometheus metrics, load-balanced tunnels, per-stream flow
-control, OS-keyring secret storage, and fuzzing of the frame parser and
-control codec.
+control, OS-keyring secret storage, fuzzing of the frame parser and control
+codec, and structured request logs with bounded redacted replay
+(`/api/v1/requests`, `kproxy requests`).
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full phased plan.
 

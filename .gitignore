@@ -1,7 +1,7 @@
 # Binaries
 bin/
-kproxy
-kproxyd
+/kproxy
+/kproxyd
 *.exe
 *.dll
 dist/

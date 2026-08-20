@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"kproxy/internal/admin"
 	"kproxy/internal/agent"
 	"kproxy/internal/protocol"
 	"kproxy/internal/relay"
@@ -281,4 +282,127 @@ func httpGet(t *testing.T, baseURL, path string) *http.Response {
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func TestRequestsEndpoint(t *testing.T) {
+	keyStore, err := store.Open(filepath.Join(t.TempDir(), "keys.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secret, err := keyStore.Create("tester", 0, store.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := relay.New(relay.Config{
+		Domain:         "kproxy.test",
+		Scheme:         "http",
+		TCPStart:       30000,
+		TCPEnd:         39999,
+		Keys:           keyStore,
+		RequestLogSize: 10,
+	})
+	defer srv.Close()
+	h, err := server.NewHandler(srv, keyStore, "boot-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpLn.Close()
+	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	go hs.Serve(httpLn)
+	t.Cleanup(func() { hs.Close() })
+
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+	go func() {
+		for {
+			conn, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			go srv.HandleAgent(conn)
+		}
+	}()
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	defer local.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	welCh := make(chan protocol.Welcome, 1)
+	var host string
+	ag := agent.New(agent.Config{
+		ServerURL: "http://" + ctrlLn.Addr().String(),
+		APIKey:    secret,
+		Tunnels:   []protocol.TunnelSpec{{ID: "main", Proto: "http", Local: strings.TrimPrefix(local.URL, "http://")}},
+		OnWelcome: func(w protocol.Welcome) { welCh <- w },
+	})
+	go ag.Run(ctx)
+	select {
+	case w := <-welCh:
+		host = strings.TrimPrefix(w.Tunnels[0].PublicURL, "http://")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for welcome")
+	}
+
+	// Endpoint requires admin auth.
+	resp := httpGet(t, ts.URL, "/api/v1/requests")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Fire a request carrying a secret in the query string.
+	req, err := http.NewRequest("GET", "http://"+httpLn.Addr().String()+"/v1/hit?api_key=supersecret", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+
+	// Replay returns the entry with the query string redacted.
+	reqs, err := admin.ListRequests(ts.URL, "boot-secret", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d, want 1", len(reqs))
+	}
+	got := reqs[0]
+	if got.Path != "/v1/hit" {
+		t.Fatalf("path = %q, want /v1/hit (query redacted)", got.Path)
+	}
+	if got.Method != "GET" || got.Status != 200 || got.Host != host {
+		t.Fatalf("entry = %+v", got)
+	}
+
+	// limit is honored and invalid values are rejected.
+	limited, err := admin.ListRequests(ts.URL, "boot-secret", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != len(reqs) {
+		t.Fatalf("limit=0 returned %d, want %d", len(limited), len(reqs))
+	}
+	resp = doAuth(t, ts.URL, "boot-secret", "GET", "/api/v1/requests?limit=abc", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad limit status = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

@@ -109,7 +109,7 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 │   ├── metrics/                stdlib Prometheus registry (labeled counters/gauges)
 │   ├── protocol/               wire framing, stream multiplexer, control msgs
 │   ├── ratelimit/              stdlib token buckets (rate / bandwidth pacing)
-│   ├── relay/                  server registry, host/port allocation, routing, events
+│   ├── relay/                  server registry, host/port allocation, routing, events, request log
 │   ├── server/                 control-plane API + embedded dashboard (go:embed)
 │   ├── store/                  JSON-file-backed api key store
 │   ├── units/                  size / duration parsing shared by admin + relay
@@ -137,8 +137,8 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 | `auth` | Argon2id hashing and secret generation | — |
 | `store` | Api key persistence and validation | `Store`, `KeyInfo`, `KeyIdentity`, `Limits` |
 | `ratelimit` | Token-bucket rate/bandwidth limits | `Bucket` |
-| `admin` | Admin HTTP API client used by the CLI | `CreateKey`, `ListKeys`, `RevokeKey` |
-| `server` | Versioned control API + SSE + embedded dashboard | `NewHandler`, `handleStream` |
+| `admin` | Admin HTTP API client used by the CLI | `CreateKey`, `ListKeys`, `RevokeKey`, `ListRequests` |
+| `server` | Versioned control API + SSE + embedded dashboard | `NewHandler`, `handleStream`, `handleRequests` |
 | `config` | Config file read/write | `AgentConfig` |
 | `keyring` | OS-keyring secrets (`keyring:NAME` refs) | `Ring`, `Resolve` |
 | `metrics` | Prometheus text-format registry | `Registry`, `Counter`, `Gauge` |
@@ -540,12 +540,22 @@ moved ahead of positionals (while keeping flag/value pairs together via the
   protection. `keyring.Resolve` expands `keyring:NAME` references; the CLI
   (`kproxy keyring set|get|rm|list`) and both `--api-key`/`--admin-key`
   resolvers use it.
+- **Request logs & replay (Phase 8):** `relay.Server` keeps a bounded ring of
+  recent proxied requests (`Config.RequestLogSize`, `kproxyd --request-log`,
+  default 1000, 0 = off). Every HTTP request (incl. 101 upgrades) is recorded
+  via `publishRequestEvent`, which also emits a structured `slog` line. The
+  captured `RequestInfo` redacts aggressively — only the URL *path* is stored;
+  query strings, headers and bodies are never captured. `Server.Requests(limit)`
+  returns the newest-first snapshot; `internal/server` serves it at
+  `GET /api/v1/requests` (`?limit=` capped at 1000) behind `admin.Auth`, and
+  `admin.ListRequests` is the CLI client.
 - **Control API + dashboard:** `internal/server.NewHandler(srv, store, adminKey)`
   serves `GET /api/v1/tunnels` (live snapshot from `relay.Server.Tunnels()`),
   `GET /api/v1/tunnels/stream` (SSE: `tunnel_open`/`tunnel_close`/`request`
   events from `relay.Server.Subscribe()` with a 15 s heartbeat),
   `GET /api/v1/status` (aggregate from `relay.Server.Status()`),
-  `GET /api/v1/domains/{domain}/token` (DNS TXT verification token), and key
+  `GET /api/v1/domains/{domain}/token` (DNS TXT verification token),
+  `GET /api/v1/requests` (bounded replay of recent requests), and key
   CRUD proxied to the store. The dashboard is the built React/Vite app in
   `internal/server/dashboard` embedded with `//go:embed`; rebuild via
   `make web`. The admin CLI is just another client of the same `/api/v1/*`
@@ -649,6 +659,9 @@ Spin up a real `relay.Server` with HTTP + control listeners and a real
 - **load balancing** — two agents claiming the same subdomain both serve
   traffic (least-active / round-robin) and the survivor keeps serving after
   one disconnects (`TestLoadBalancedHTTPTunnels`)
+- **request log** — bounded ring retention (newest-first, query strings
+  redacted from captured paths) and retention fully disabled when
+  `RequestLogSize` is zero
 
 The `testEnv` harness builds a server on ephemeral ports and registers cleanup
 with `t.Cleanup`, so tests are hermetic and parallel-safe.
@@ -667,6 +680,9 @@ Exercise the embedded dashboard handler end-to-end over HTTP with a real relay
   when verification is enabled and 503 when it is disabled
 - SSE stream (`?token=` auth): `text/event-stream` content type and a live
   `request` event flowing through the stream when a request hits the tunnel
+- `GET /api/v1/requests` (via `admin.ListRequests`): a bounded newest-first
+  replay with the query string redacted, requires auth (401), and rejects a
+  bad `limit` (400)
 
 ### CLI tests — `cmd/kproxy/main_test.go`
 
@@ -856,7 +872,7 @@ them in `internal/admin`, and surface them in `kproxy key ...`.
 
 ## 12. Status & roadmap
 
-**Implemented (Phases 0–7):** protocol & multiplexer, HTTP + TCP tunnels,
+**Implemented (Phases 0–8):** protocol & multiplexer, HTTP + TCP tunnels,
 hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
 config files, WebSocket upgrades, reconnect with backoff, keepalives,
 graceful tunnel close + local-target auto-recovery, per-user API keys
@@ -871,10 +887,9 @@ suite, cross-platform build, packaging (GoReleaser archives + deb/rpm +
 Windows MSI via WiX, systemd unit, Docker image, one-command bootstrap),
 Prometheus metrics (`/metrics` behind admin auth), load-balanced tunnels
 (`tunnelSet`), per-stream flow control (`FrameWindow`), OS-keyring secret
-storage (DPAPI on Windows), and fuzzing of the frame parser + control codec.
-
-**Planned (see [docs/roadmap.md](docs/roadmap.md)):** structured request logs
-with redaction and retention.
+storage (DPAPI on Windows), fuzzing of the frame parser + control codec, and
+structured request logs with bounded redacted replay (`/api/v1/requests`,
+`kproxy requests`).
 
 ---
 

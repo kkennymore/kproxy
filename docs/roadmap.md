@@ -2,7 +2,7 @@
 
 ## Status
 
-Phases 0–7 are implemented and tested. Remaining phases extend the foundation
+Phases 0–8 are implemented and tested. Remaining phases extend the foundation
 without redesigning it.
 
 ## Phase 2 — Multi-tunnel ergonomics ✅
@@ -208,12 +208,23 @@ Done:
   `FuzzControlRoundTrip` (JSON codec stability), `FuzzUnmarshalControl`,
   `FuzzApplySpecOptions` (hostile tunnel specs). `go test -fuzz` runs green.
 
-Remaining candidates from the original Phase 7 scope (structured request logs
-with retention) are tracked below for a future phase.
+## Phase 8 — Request logs & replay ✅
 
-## Phase 8 — Observability extras (candidate)
+Done:
 
-- Structured request logs with redaction; optional replay/log retention.
+- **Structured request logging with redaction**: every proxied HTTP request
+  (including 101 upgrades) is logged by the relay with method, host, path,
+  status, duration, bytes and request ID. Redaction policy: only the URL path
+  is recorded — query strings, headers and bodies are never captured, so
+  secrets (e.g. `?api_key=...`) cannot leak into logs or the API.
+- **Bounded retention & replay**: `internal/relay` keeps a bounded ring of
+  recent requests (`Config.RequestLogSize`, `kproxyd --request-log N`,
+  default 1000, `0` disables). `GET /api/v1/requests` (admin-Bearer auth,
+  `?limit=` up to 1000) serves the replay newest-first, and `kproxy requests
+  [--limit N]` prints it. `admin.ListRequests` is the client.
+- Tests: relay ring retention (bounded, newest-first, query redacted, disabled
+  at 0) and the server endpoint (auth, redaction over HTTP, invalid limit →
+  400) exercised through the admin client.
 
 ## Extension guide
 

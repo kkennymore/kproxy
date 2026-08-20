@@ -70,6 +70,10 @@ type Config struct {
 	TXTLookup func(ctx context.Context, name string) ([]string, error)
 	// Logger receives relay logs.
 	Logger *slog.Logger
+	// RequestLogSize bounds the number of recent proxied requests kept for
+	// replay via Server.Requests (and GET /api/v1/requests). Zero disables
+	// retention.
+	RequestLogSize int
 }
 
 // Server routes client traffic to the agent that owns each tunnel.
@@ -84,6 +88,7 @@ type Server struct {
 	agents       map[*client]struct{}
 	verified     map[string]struct{}
 	events       broadcaster
+	requestLog   *requestLog
 
 	metrics  *metrics.Registry
 	mReq     *metrics.Metric // kproxy_requests_total
@@ -208,6 +213,7 @@ func New(cfg Config) *Server {
 		tcpListeners: make(map[int]net.Listener),
 		agents:       make(map[*client]struct{}),
 		verified:     make(map[string]struct{}),
+		requestLog:   newRequestLog(cfg.RequestLogSize),
 		metrics:      reg,
 		mReq:         reg.Counter("kproxy_requests_total", "HTTP requests and TCP connections proxied.", "tunnel", "proto"),
 		mBytes:       reg.Counter("kproxy_tunnel_bytes_total", "Bytes transferred through tunnels (both directions).", "tunnel", "proto"),
@@ -1038,7 +1044,7 @@ func (s *Server) proxyHTTP(t *tunnel, w http.ResponseWriter, r *http.Request, ri
 }
 
 func (s *Server) publishRequestEvent(t *tunnel, r *http.Request, start time.Time, status int, bytes int64, rid string) {
-	s.publish(Event{Type: "request", Request: &RequestInfo{
+	info := RequestInfo{
 		Time:      start,
 		Host:      t.host,
 		Method:    r.Method,
@@ -1047,7 +1053,26 @@ func (s *Server) publishRequestEvent(t *tunnel, r *http.Request, start time.Time
 		Duration:  time.Since(start),
 		Bytes:     bytes,
 		RequestID: rid,
-	}})
+	}
+	s.requestLog.add(info)
+	s.log.Info("request",
+		"host", info.Host,
+		"method", info.Method,
+		"path", info.Path,
+		"status", info.Status,
+		"duration_ms", info.Duration.Milliseconds(),
+		"bytes", info.Bytes,
+		"request_id", info.RequestID,
+	)
+	s.publish(Event{Type: "request", Request: &info})
+}
+
+// Requests returns up to limit recently proxied requests, newest first. The
+// log is bounded by the server's RequestLogSize; a zero limit returns all
+// retained entries. Paths are redacted to the URL path (never the query
+// string), and headers/bodies are never captured.
+func (s *Server) Requests(limit int) []RequestInfo {
+	return s.requestLog.snapshot(limit)
 }
 
 // statusWriter records the response status and bytes written so the request

@@ -11,9 +11,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"kproxy/internal/relay"
 	"kproxy/internal/store"
 	"kproxy/internal/units"
 )
@@ -221,6 +223,31 @@ func DomainToken(baseURL, adminKey, domain string) (string, error) {
 		return "", err
 	}
 	return out.Token, nil
+}
+
+// ListRequests returns up to limit recently proxied requests (newest first)
+// from the relay's bounded replay log. A limit of 0 returns all retained
+// entries.
+func ListRequests(baseURL, adminKey string, limit int) ([]relay.RequestInfo, error) {
+	path := "/api/v1/requests"
+	if limit > 0 {
+		path += "?limit=" + strconv.Itoa(limit)
+	}
+	resp, err := doJSON(baseURL, adminKey, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	var out struct {
+		Requests []relay.RequestInfo `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Requests, nil
 }
 
 func doJSON(baseURL, adminKey, method, path string, body []byte) (*http.Response, error) {

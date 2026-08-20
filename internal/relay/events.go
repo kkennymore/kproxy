@@ -27,6 +27,8 @@ type TunnelInfo struct {
 }
 
 // RequestInfo describes one proxied HTTP request for the request inspector.
+// It intentionally omits headers and query strings so secrets are never
+// captured.
 type RequestInfo struct {
 	Time      time.Time     `json:"time"`
 	Host      string        `json:"host"`
@@ -36,6 +38,44 @@ type RequestInfo struct {
 	Duration  time.Duration `json:"duration"`
 	Bytes     int64         `json:"bytes"`
 	RequestID string        `json:"request_id,omitempty"`
+}
+
+// requestLog is a bounded, concurrency-safe ring of recent RequestInfos.
+type requestLog struct {
+	mu      sync.Mutex
+	entries []RequestInfo
+	max     int
+}
+
+func newRequestLog(max int) *requestLog {
+	return &requestLog{max: max}
+}
+
+func (rl *requestLog) add(e RequestInfo) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.max <= 0 {
+		return
+	}
+	rl.entries = append(rl.entries, e)
+	if len(rl.entries) > rl.max {
+		rl.entries = append([]RequestInfo(nil), rl.entries[len(rl.entries)-rl.max:]...)
+	}
+}
+
+// snapshot returns up to limit entries, newest first.
+func (rl *requestLog) snapshot(limit int) []RequestInfo {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	n := len(rl.entries)
+	if limit <= 0 || limit > n {
+		limit = n
+	}
+	out := make([]RequestInfo, limit)
+	for i := range out {
+		out[i] = rl.entries[n-1-i]
+	}
+	return out
 }
 
 // Event is streamed to control-plane subscribers (the dashboard's SSE feed).

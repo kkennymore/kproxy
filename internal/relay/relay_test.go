@@ -32,13 +32,20 @@ type testEnv struct {
 }
 
 func newEnv(t *testing.T) *testEnv {
+	return newEnvWith(t, relay.Config{})
+}
+
+func newEnvWith(t *testing.T, cfg relay.Config) *testEnv {
 	t.Helper()
-	srv := relay.New(relay.Config{
-		Domain:   "kproxy.test",
-		Scheme:   "http",
-		TCPStart: 30000,
-		TCPEnd:   39999,
-	})
+	cfg.Domain = "kproxy.test"
+	cfg.Scheme = "http"
+	if cfg.TCPStart == 0 {
+		cfg.TCPStart = 30000
+	}
+	if cfg.TCPEnd == 0 {
+		cfg.TCPEnd = 39999
+	}
+	srv := relay.New(cfg)
 
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1630,4 +1637,87 @@ func TestLoadBalancedHTTPTunnels(t *testing.T) {
 		}
 	}
 	_ = agB
+}
+
+func TestRequestLogRetention(t *testing.T) {
+	e := newEnvWith(t, relay.Config{RequestLogSize: 3})
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	t.Cleanup(target.Close)
+
+	wel := e.startAgent(t, []protocol.TunnelSpec{
+		{ID: "main", Proto: "http", Local: strings.TrimPrefix(target.URL, "http://"), Subdomain: "log"},
+	})
+	e.waitWelcome(wel)
+
+	do := func(path string) {
+		t.Helper()
+		req, err := http.NewRequest("GET", "http://"+e.httpAddr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "log.kproxy.test"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+
+	// The query string must never be captured in the request log.
+	do("/a/b?token=supersecret")
+	reqs := e.srv.Requests(0)
+	if len(reqs) != 1 {
+		t.Fatalf("Requests(0) = %d entries, want 1", len(reqs))
+	}
+	if reqs[0].Path != "/a/b" {
+		t.Fatalf("captured path = %q, want /a/b (query redacted)", reqs[0].Path)
+	}
+	if reqs[0].Host != "log.kproxy.test" || reqs[0].Method != "GET" || reqs[0].Status != 200 {
+		t.Fatalf("unexpected entry: %+v", reqs[0])
+	}
+
+	// Ring is bounded and returns newest first.
+	do("/one")
+	do("/two")
+	do("/three")
+	reqs = e.srv.Requests(0)
+	if len(reqs) != 3 {
+		t.Fatalf("Requests(0) = %d entries, want 3 (bounded at 3)", len(reqs))
+	}
+	want := []string{"/three", "/two", "/one"}
+	for i, w := range want {
+		if reqs[i].Path != w {
+			t.Fatalf("Requests(0)[%d] = %q, want %q (newest first)", i, reqs[i].Path, w)
+		}
+	}
+	if got := len(e.srv.Requests(2)); got != 2 {
+		t.Fatalf("Requests(2) = %d, want 2", got)
+	}
+}
+
+func TestRequestLogDisabled(t *testing.T) {
+	e := newEnv(t) // RequestLogSize zero => retention disabled
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(target.Close)
+
+	wel := e.startAgent(t, []protocol.TunnelSpec{
+		{ID: "main", Proto: "http", Local: strings.TrimPrefix(target.URL, "http://"), Subdomain: "nolog"},
+	})
+	e.waitWelcome(wel)
+
+	resp, err := e.do("GET", "nolog.kproxy.test", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := len(e.srv.Requests(0)); got != 0 {
+		t.Fatalf("Requests(0) = %d, want 0 with retention disabled", got)
+	}
 }

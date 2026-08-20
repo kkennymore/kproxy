@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"time"
 
 	"kproxy/internal/admin"
@@ -35,6 +36,7 @@ func NewHandler(rly *relay.Server, st *store.Store, adminKey string) (http.Handl
 	mux.Handle("GET /api/v1/tunnels/stream", admin.Auth(http.HandlerFunc(handleStream(rly)), adminKey))
 	mux.Handle("GET /api/v1/status", admin.Auth(http.HandlerFunc(handleStatus(rly)), adminKey))
 	mux.Handle("GET /api/v1/domains/{domain}/token", admin.Auth(http.HandlerFunc(handleDomainToken(rly)), adminKey))
+	mux.Handle("GET /api/v1/requests", admin.Auth(http.HandlerFunc(handleRequests(rly)), adminKey))
 	mux.Handle("GET /metrics", admin.Auth(rly.MetricsHandler(), adminKey))
 	mux.Handle("/", http.FileServerFS(sub))
 	return mux, nil
@@ -67,6 +69,25 @@ func handleDomainToken(rly *relay.Server) http.HandlerFunc {
 func handleTunnels(rly *relay.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"tunnels": rly.Tunnels()})
+	}
+}
+
+// maxReplayLimit caps how many retained requests a single request can fetch.
+const maxReplayLimit = 1000
+
+// handleRequests serves the bounded replay of recent proxied requests.
+func handleRequests(rly *relay.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		limit := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				http.Error(w, "invalid limit", http.StatusBadRequest)
+				return
+			}
+			limit = min(n, maxReplayLimit)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"requests": rly.Requests(limit)})
 	}
 }
 
