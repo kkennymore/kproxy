@@ -174,34 +174,169 @@ For the full protocol and implementation details, see
 
 ## Installation
 
-### From source
+### From source (any OS)
+
+Requires Go ≥ 1.24. No other toolchain needed — the embedded dashboard ships
+pre-built, so a plain `go build` works without node.
 
 ```sh
-git clone <your-repo-url> kproxy
+git clone https://github.com/kkennymore/kproxy.git
 cd kproxy
 make build            # builds bin/kproxy and bin/kproxyd
 ```
 
-Or install to your Go bin directory:
+Or install straight into your Go bin directory:
 
 ```sh
-go install ./cmd/kproxy ./cmd/kproxyd
+go install github.com/kkennymore/kproxy/cmd/kproxy github.com/kkennymore/kproxy/cmd/kproxyd
 ```
 
-### Prebuilt binaries
+The produced binaries (`kproxy`, `kproxyd` — `kproxy.exe`/`kproxyd.exe` on
+Windows) are fully static and have no runtime dependencies, so you can copy
+them onto any machine of the same OS/arch and run them as-is.
 
-Prebuilt releases are published for every tagged version:
+### Prebuilt releases
+
+Every tagged release publishes both binaries for amd64 + arm64:
 
 | Platform | Artifacts |
 |---|---|
 | Windows | `.zip`, `.msi` (WiX installer) |
-| Linux | `.tar.gz`, `.deb`, `.rpm` (amd64 + arm64) |
-| macOS | `.zip` (amd64 + arm64) |
+| Linux | `.tar.gz`, `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL) |
+| macOS | `.zip` |
 
-Every archive contains both binaries (`kproxy`, `kproxyd`) plus a
-`checksums.txt`. See the [releases page](https://github.com/kkennymore/kproxy/releases)
-for the latest. For a one-command Linux server install (systemd + config),
-see [Deployment](#deployment).
+Every archive contains `kproxy` + `kproxyd` + `checksums.txt`. See the
+[releases page](https://github.com/kkennymore/kproxy/releases) for the latest.
+
+### Linux
+
+#### Debian / Ubuntu (deb)
+
+```sh
+sudo apt update
+sudo apt install -y ./kproxy_<version>_linux_amd64.deb
+# installs kproxyd to /usr/bin + a hardened systemd unit, then starts it
+```
+
+The post-install script installs and starts the systemd service. Configure it
+via `/etc/kproxy/kproxyd.env`, then `sudo systemctl restart kproxyd`.
+
+#### Fedora / RHEL (rpm)
+
+```sh
+sudo dnf install -y ./kproxy_<version>_linux_amd64.rpm
+sudo systemctl enable --now kproxyd
+```
+
+If you built from source instead:
+
+```sh
+sudo cp bin/kproxy bin/kproxyd /usr/local/bin/
+```
+
+Open the ports the server needs:
+
+```sh
+sudo firewall-cmd --permanent --add-service=http --add-service=https
+sudo firewall-cmd --permanent --add-port=55555/tcp      # agent control
+sudo firewall-cmd --permanent --add-port=20000-29999/tcp  # TCP tunnels
+sudo firewall-cmd --reload
+```
+
+Install and start it as a service:
+
+```sh
+sudo mkdir -p /etc/kproxy
+sudo tee /etc/kproxy/kproxyd.env >/dev/null <<'EOF'
+KPROXY_DOMAIN=yourdomain.com
+KPROXY_ACME_EMAIL=you@example.com
+KPROXY_ADMIN_KEY=choose-a-strong-secret
+EOF
+sudo curl -fsSL https://raw.githubusercontent.com/kkennymore/kproxy/main/packaging/kproxyd.service \
+  -o /usr/lib/systemd/system/kproxyd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now kproxyd
+journalctl -u kproxyd -f
+```
+
+The unit runs `kproxyd` as a dynamic user with strict hardening
+(`NoNewPrivileges`, `ProtectSystem=strict`, `CAP_NET_BIND_SERVICE` for
+:80/:443) and stores state in `/var/lib/kproxy`. If it fails to start, check
+SELinux with `ausearch -m avc -ts recent`.
+
+#### Any other Linux (tar.gz)
+
+```sh
+tar -xzf kproxy_<version>_linux_amd64.tar.gz
+sudo install -m 0755 kproxyd kproxy /usr/local/bin/
+```
+
+### Windows
+
+#### MSI installer
+
+```powershell
+# double-click kproxy_<version>_windows_amd64.msi, or install silently:
+Start-Process msiexec -ArgumentList '/i','kproxy_<version>_windows_amd64.msi','/qn' -Wait
+```
+
+Installs both binaries to `%ProgramFiles%\kproxy\`. Add them to `PATH` or call
+them by full path:
+
+```powershell
+& "$env:ProgramFiles\kproxy\kproxy.exe" --version
+```
+
+#### Zip (portable)
+
+```powershell
+Expand-Archive kproxy_<version>_windows_amd64.zip -DestinationPath $env:LOCALAPPDATA\kproxy
+$env:PATH += ";$env:LOCALAPPDATA\kproxy"
+kproxy.exe --version
+```
+
+Firewall: the **agent** only makes outbound connections, so nothing to open.
+The **server** needs inbound rules for the public ports
+(`netsh advfirewall firewall add rule ...` for 80/443, `55555`, and the TCP
+tunnel range) if you host a relay on Windows.
+
+### macOS
+
+```sh
+tar -xzf kproxy_<version>_darwin_arm64.tar.gz   # or _amd64 for Intel
+sudo install -m 0755 kproxyd kproxy /usr/local/bin/
+```
+
+Or install via Go:
+
+```sh
+go install github.com/kkennymore/kproxy/cmd/kproxy github.com/kkennymore/kproxy/cmd/kproxyd
+```
+
+If Gatekeeper blocks an unsigned prebuilt binary, right-click it in Finder →
+**Open**, or remove the quarantine attribute once:
+
+```sh
+xattr -d com.apple.quarantine kproxy kproxyd
+```
+
+### Docker
+
+A multi-arch image is built from `packaging/Dockerfile` (see
+[Deployment](#deployment) for the full command):
+
+```sh
+docker run -d --name kproxyd --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 55555:55555 \
+  -v kproxyd-data:/var/lib/kproxy \
+  kproxyd:latest \
+  --domain yourdomain.com --acme-email you@example.com --admin-key "choose-a-strong-secret"
+```
+
+The **usage is identical on every OS** — the same `kproxyd` flags, `kproxy`
+commands, config file and keyring behavior (Windows uses DPAPI-encrypted
+secrets; macOS/Linux use an owner-only file). On Windows the binaries are
+`kproxy.exe`/`kproxyd.exe`; the examples below use the Unix names.
 
 ---
 
