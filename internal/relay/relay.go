@@ -78,7 +78,7 @@ type Server struct {
 	log *slog.Logger
 
 	mu           sync.RWMutex
-	httpTunnels  map[string]*tunnel
+	httpTunnels  map[string]*tunnelSet
 	tcpTunnels   map[string]*tunnel
 	tcpListeners map[int]net.Listener
 	agents       map[*client]struct{}
@@ -116,8 +116,59 @@ type tunnel struct {
 	requestTimeout time.Duration
 	requests       atomic.Int64
 	bytes          atomic.Int64
+	active         atomic.Int64 // concurrent requests/connections (load balancing)
 	lastActive     atomic.Int64 // unix nanos, 0 = none
 	labels         []string     // metric label values: [tunnel, proto]
+}
+
+// tunnelSet groups HTTP tunnels that share a public host, so client traffic
+// is distributed across multiple agents serving the same subdomain.
+type tunnelSet struct {
+	tunnels map[*tunnel]struct{}
+	order   []*tunnel // stable insertion order for fair round-robin
+	rr      uint64    // round-robin cursor
+}
+
+func newTunnelSet(t *tunnel) *tunnelSet {
+	return &tunnelSet{tunnels: map[*tunnel]struct{}{t: {}}, order: []*tunnel{t}}
+}
+
+func (set *tunnelSet) add(t *tunnel) {
+	set.tunnels[t] = struct{}{}
+	set.order = append(set.order, t)
+}
+
+func (set *tunnelSet) remove(t *tunnel) {
+	delete(set.tunnels, t)
+	for i, x := range set.order {
+		if x == t {
+			set.order = append(set.order[:i], set.order[i+1:]...)
+			return
+		}
+	}
+}
+
+// pick returns a tunnel with the fewest active connections, choosing among
+// ties round-robin over the stable insertion order. The caller must hold
+// s.mu.
+func (set *tunnelSet) pick() *tunnel {
+	var min int64 = -1
+	for t := range set.tunnels {
+		if a := t.active.Load(); min == -1 || a < min {
+			min = a
+		}
+	}
+	if min < 0 {
+		return nil
+	}
+	n := len(set.order)
+	start := int(atomic.AddUint64(&set.rr, 1))
+	for i := 0; i < n; i++ {
+		if t := set.order[(start+i)%n]; t.active.Load() == min {
+			return t
+		}
+	}
+	return nil
 }
 
 type client struct {
@@ -152,7 +203,7 @@ func New(cfg Config) *Server {
 	return &Server{
 		cfg:          cfg,
 		log:          cfg.Logger,
-		httpTunnels:  make(map[string]*tunnel),
+		httpTunnels:  make(map[string]*tunnelSet),
 		tcpTunnels:   make(map[string]*tunnel),
 		tcpListeners: make(map[int]net.Listener),
 		agents:       make(map[*client]struct{}),
@@ -295,7 +346,12 @@ func (s *Server) closeTunnels(c *client, ids []string) {
 		info := t.info()
 		switch t.proto {
 		case protocol.ProtoHTTP:
-			delete(s.httpTunnels, t.host)
+			if set, ok := s.httpTunnels[t.host]; ok {
+				set.remove(t)
+				if len(set.tunnels) == 0 {
+					delete(s.httpTunnels, t.host)
+				}
+			}
 			s.log.Info("tunnel closed", "host", t.host, "agent", c.id)
 		case protocol.ProtoTCP:
 			if ln, ok := s.tcpListeners[t.port]; ok {
@@ -389,7 +445,12 @@ func (s *Server) registerSpecLocked(c *client, spec protocol.TunnelSpec) (*tunne
 			openedAt:  time.Now(),
 			client:    c,
 		}
-		s.httpTunnels[host] = t
+		set, ok := s.httpTunnels[host]
+		if !ok {
+			s.httpTunnels[host] = newTunnelSet(t)
+		} else {
+			set.add(t)
+		}
 		info := t.info()
 		s.publish(Event{Type: "tunnel_open", Tunnel: &info})
 
@@ -417,7 +478,12 @@ func (s *Server) registerSpecLocked(c *client, spec protocol.TunnelSpec) (*tunne
 		return nil, fmt.Errorf("unsupported tunnel protocol %q", spec.Proto)
 	}
 	if err := applySpecOptions(t, spec); err != nil {
-		delete(s.httpTunnels, t.host)
+		if set, ok := s.httpTunnels[t.host]; ok {
+			set.remove(t)
+			if len(set.tunnels) == 0 {
+				delete(s.httpTunnels, t.host)
+			}
+		}
 		delete(s.tcpTunnels, t.id)
 		if t.port != 0 {
 			if ln, ok := s.tcpListeners[t.port]; ok {
@@ -670,9 +736,8 @@ func (s *Server) allocateHTTPHostLocked(spec protocol.TunnelSpec) (string, error
 	if host == "" {
 		return "", errors.New("cannot allocate host without a domain or subdomain")
 	}
-	if _, taken := s.httpTunnels[host]; taken {
-		return "", fmt.Errorf("host %q already in use", host)
-	}
+	// A claimed subdomain may already be served by another agent; the caller
+	// adds this tunnel to that host's set to load-balance across them.
 	return host, nil
 }
 
@@ -725,6 +790,8 @@ func (s *Server) acceptTCP(t *tunnel, ln net.Listener) {
 			}
 			t.markRequest(0)
 			s.mReq.Inc(t.labels...)
+			t.active.Add(1)
+			defer t.active.Add(-1)
 			st, err := t.client.openStream(t.id)
 			if err != nil {
 				conn.Close()
@@ -833,12 +900,17 @@ func (s *Server) detach(c *client) {
 	defer s.mu.Unlock()
 	delete(s.agents, c)
 
-	for host, t := range s.httpTunnels {
-		if t.client == c {
+	for host, set := range s.httpTunnels {
+		for t := range set.tunnels {
+			if t.client == c {
+				set.remove(t)
+				s.log.Info("tunnel offline", "host", t.host, "agent", c.id)
+				info := t.info()
+				s.publish(Event{Type: "tunnel_close", Tunnel: &info})
+			}
+		}
+		if len(set.tunnels) == 0 {
 			delete(s.httpTunnels, host)
-			s.log.Info("tunnel offline", "host", host, "agent", c.id)
-			info := t.info()
-			s.publish(Event{Type: "tunnel_close", Tunnel: &info})
 		}
 	}
 	for id, t := range s.tcpTunnels {
@@ -895,9 +967,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := hostOnly(r.Host)
 	s.mu.RLock()
-	t := s.httpTunnels[host]
+	set := s.httpTunnels[host]
+	var t *tunnel
+	if set != nil {
+		t = set.pick()
+	}
 	s.mu.RUnlock()
-	if t == nil {
+	if set == nil {
 		if host == s.cfg.Domain || host == "" {
 			s.serveLanding(w, r)
 			return
@@ -928,13 +1004,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	rid := newID(8)
 	r.Header.Set("X-Request-Id", rid)
+	proxy := func(w http.ResponseWriter, r *http.Request) {
+		s.proxyHTTP(t, w, r, rid)
+	}
 	if t.requestTimeout > 0 {
-		http.TimeoutHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			s.proxyHTTP(t, w, r, rid)
-		}), t.requestTimeout, "request timed out").ServeHTTP(w, r)
+		http.TimeoutHandler(http.HandlerFunc(proxy), t.requestTimeout, "request timed out").ServeHTTP(w, r)
 		return
 	}
-	s.proxyHTTP(t, w, r, rid)
+	proxy(w, r)
 }
 
 func (s *Server) serveLanding(w http.ResponseWriter, r *http.Request) {
@@ -943,7 +1020,8 @@ func (s *Server) serveLanding(w http.ResponseWriter, r *http.Request) {
 }
 
 // proxyHTTP relays a single public HTTP request over a tunnel stream and
-// publishes a request event to control-plane subscribers.
+// publishes a request event to control-plane subscribers. The tunnel is
+// chosen once by serveHTTP (load balancing); this helper only opens it.
 func (s *Server) proxyHTTP(t *tunnel, w http.ResponseWriter, r *http.Request, rid string) {
 	start := time.Now()
 	if isUpgrade(r) {
@@ -1003,14 +1081,20 @@ func (sw *statusWriter) statusCode() int {
 	return sw.status
 }
 
-// proxy relays one request over the tunnel stream without instrumentation.
+// proxy relays one request over the given tunnel's stream without
+// instrumentation. It returns nil when the tunnel is offline so the caller
+// can surface a gateway error.
 func (s *Server) proxy(t *tunnel, w http.ResponseWriter, r *http.Request) {
 	st, err := t.client.openStream(t.id)
 	if err != nil {
 		http.Error(w, "tunnel offline", http.StatusBadGateway)
 		return
 	}
-	defer st.Close()
+	t.active.Add(1)
+	defer func() {
+		t.active.Add(-1)
+		st.Close()
+	}()
 
 	if err := r.Write(t.client.pace(st)); err != nil {
 		if isBodyTooLarge(err) {
@@ -1086,23 +1170,25 @@ func (s *Server) proxyHTTPUpgrade(t *tunnel, w http.ResponseWriter, r *http.Requ
 		clientConn.Close()
 		return
 	}
+	t.active.Add(1)
+	defer func() {
+		t.active.Add(-1)
+		st.Close()
+	}()
 
 	if err := r.Write(t.client.pace(st)); err != nil {
 		clientConn.Close()
-		st.Close()
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(st), r)
 	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
 		_, _ = io.WriteString(clientConn, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
 		clientConn.Close()
-		st.Close()
 		return
 	}
 	resp.Header.Set("X-Request-Id", rid)
 	if err := resp.Write(rw); err != nil {
 		clientConn.Close()
-		st.Close()
 		return
 	}
 	rw.Flush()

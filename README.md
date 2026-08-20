@@ -102,11 +102,16 @@ For the full protocol and implementation details, see
 - **Automatic reconnect** with exponential backoff (1s → 30s) when the network
   blips; tunnels are re-registered transparently.
 - **Keepalive pings** on both sides detect and drop half-open connections.
+- **Load-balanced tunnels** — several agents may claim the same subdomain; the
+  relay distributes traffic across them by least-active-connection and keeps
+  serving from the survivors when one disconnects.
 - **Graceful tunnel close** — tunnels are released immediately on agent exit
   and when a local app stops accepting connections; the endpoint is freed and
   the tunnel reopens automatically when the app comes back (new public URL for
   random-hash hosts).
 - **Graceful shutdown** on `Ctrl+C` / `SIGTERM` for both the agent and server.
+- **Flow control** — per-stream send windows prevent a slow consumer from
+  stalling other streams over the shared multiplexed connection.
 
 ### Security
 - **Agent authentication** via per-user API keys, hashed with **argon2id**
@@ -130,6 +135,10 @@ For the full protocol and implementation details, see
   (ACME) or your own certificates.
 - **TLS 1.2+** minimum, **first-run key prompt** that stores your key in a
   per-user config file with restrictive permissions.
+- **OS keyring** — `--api-key` and `--admin-key` accept `keyring:NAME` to read
+  the secret from the OS keyring (Windows secrets are DPAPI-encrypted) instead
+  of leaving it in a config file; `kproxy keyring set|get|rm|list` manages
+  entries.
 - Local app is only reachable through the tunnel; nothing inbound is exposed
   on the dev machine.
 
@@ -141,6 +150,8 @@ For the full protocol and implementation details, see
   separate from agent API keys.
 - **JSON or human-readable logs** (`--json`, `--verbose`).
 - **Single static binary** — no runtime dependencies, no installer cruft.
+- **Prometheus metrics** — `GET /metrics` on the admin listener exposes
+  request/byte counters per tunnel, plus tunnel/agent/uptime/version gauges.
 - **Cross-platform** — Windows, Linux (deb/rpm), macOS; amd64 and arm64.
 - **Self-contained** — the only third-party dependency is Google's
   `x/crypto` (ACME client), pinned and vendored at build time.
@@ -276,7 +287,7 @@ kproxy key <cmd> [flags]       manage api keys on the relay
 | `--max-request-size SIZE` | unlimited | Cap request bodies, e.g. `1mb`; oversized requests get `413` (`http` only) |
 | `--request-timeout DURATION` | none | Bound request duration, e.g. `30s`; timed-out requests get `503` (`http` only) |
 | `--server URL` | `http://localhost:55555` | Relay server endpoint (`http://` or `https://`) |
-| `--api-key KEY` | — | API key for the relay (prompted on first run if absent) |
+| `--api-key KEY` | — | API key for the relay (prompted on first run if absent); use `keyring:NAME` to read it from the OS keyring |
 | `--config PATH` | platform default | Config file to read/write instead of the default |
 | `--verbose` | off | Debug-level logging |
 | `--json` | off | JSON log output instead of human-readable |
@@ -300,7 +311,7 @@ kproxy key list                --admin-url URL --admin-key SECRET
 | Flag | Default | Description |
 |---|---|---|
 | `--admin-url` | `http://127.0.0.1:55556` | Admin API endpoint (the server's loopback admin listener) |
-| `--admin-key` | env `KPROXY_ADMIN_KEY` | Admin secret that authenticates the request |
+| `--admin-key` | env `KPROXY_ADMIN_KEY` | Admin secret that authenticates the request; use `keyring:NAME` to read it from the OS keyring |
 | `--name` | — | Human label for a new key |
 | `--ttl` | never | Key lifetime: `24h`, `7d`, `30d`, … |
 | `--rate` | 0 (unlimited) | Max HTTP requests per second; excess requests get `429` |
@@ -310,6 +321,22 @@ kproxy key list                --admin-url URL --admin-key SECRET
 Revoking a key takes effect immediately: connected agents keep their current
 tunnels until they disconnect, and any reconnect is refused with
 `api key revoked`.
+
+#### Managing secrets in the OS keyring
+
+```
+kproxy keyring set NAME [VALUE]   store a secret (reads stdin if VALUE omitted)
+kproxy keyring get NAME           print a stored secret
+kproxy keyring rm NAME            remove a stored secret
+kproxy keyring list               list stored names
+```
+
+Windows secrets are encrypted with DPAPI (local-machine scope) before being
+written to `%AppData%\kproxy\keyring.json`; macOS/Linux use an owner-only
+(0600) file under the user config directory. Reference an entry anywhere a
+secret is accepted, e.g. `--api-key keyring:my-laptop` or
+`--admin-key keyring:relay-admin` (also works via the `KPROXY_ADMIN_KEY`
+environment variable and on `kproxyd --admin-key`).
 
 Global commands: `kproxy --version`, `kproxy help`.
 
@@ -345,8 +372,35 @@ kproxyd --domain example.com [flags]
 | `--json` | off | JSON log output |
 | `--version` | — | Print version and exit |
 
+> `--admin-key` accepts a `keyring:NAME` reference so the secret can live in
+> the OS keyring instead of an env file (see [Managing secrets in the OS
+> keyring](#managing-secrets-in-the-os-keyring)).
+
 > Exactly one of `--acme-email` or `--tls-cert/--tls-key` is required when
 > `--https-addr` is enabled.
+
+### Prometheus metrics
+
+With the admin API enabled (`--admin-addr` + `--admin-key`), the admin
+listener also serves Prometheus metrics at `/metrics`, authenticated with the
+same admin key as a Bearer token (also accepted as `?token=`), e.g.:
+
+```sh
+curl -H "Authorization: Bearer $KPROXY_ADMIN_KEY" http://127.0.0.1:55556/metrics
+```
+
+```
+kproxy_requests_total{tunnel="myapp.kproxy.test",proto="http"}  42
+kproxy_tunnel_bytes_total{tunnel="myapp.kproxy.test",proto="http"}  1048576
+kproxy_tunnels{proto="http"}  3
+kproxy_agents  2
+kproxy_uptime_seconds  86400
+kproxy_version_info{version="0.1.0"}  1
+```
+
+Counters are cumulative per tunnel (and protocol); gauge values are derived
+when the endpoint is scraped. In a Prometheus config, set `bearer_token` (or
+`bearer_token_file`) to the admin key for this job.
 
 ### Web dashboard
 
@@ -744,7 +798,7 @@ make vet      # go vet
 
 ## Status and roadmap
 
-Implemented (Phases 0–6): protocol & multiplexer, HTTP + TCP tunnels,
+Implemented (Phases 0–7): protocol & multiplexer, HTTP + TCP tunnels,
 hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
 config files, WebSocket upgrades, reconnection with backoff, keepalives,
 graceful tunnel close + auto-recovery on local-app failure, per-user API keys
@@ -756,9 +810,9 @@ tunnel list + real-time request inspector + key CRUD in an embedded web
 dashboard, TLS via ACME or static certs, agent config persistence, JSON
 logs, CI, full test suite, cross-platform build, packaging (GoReleaser
 archives + deb/rpm + Windows MSI, systemd unit, Docker image, one-command
-bootstrap script).
-
-Planned: metrics, load-balancing tunnels, flow control (7).
+bootstrap script), Prometheus metrics, load-balanced tunnels, per-stream flow
+control, OS-keyring secret storage, and fuzzing of the frame parser and
+control codec.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full phased plan.
 

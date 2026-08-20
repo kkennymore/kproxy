@@ -105,6 +105,8 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 │   ├── agent/                  agent control loop, reconnect/backoff, accept loop
 │   ├── auth/                   argon2id hashing + secret generation
 │   ├── config/                 agent config file persistence
+│   ├── keyring/                OS-keyring secret store (Windows DPAPI, 0600 file elsewhere)
+│   ├── metrics/                stdlib Prometheus registry (labeled counters/gauges)
 │   ├── protocol/               wire framing, stream multiplexer, control msgs
 │   ├── ratelimit/              stdlib token buckets (rate / bandwidth pacing)
 │   ├── relay/                  server registry, host/port allocation, routing, events
@@ -130,7 +132,7 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 | Package | Responsibility | Key types |
 |---|---|---|
 | `protocol` | Wire format, multiplexing, byte bridge | `Mux`, `Stream`, `FrameType`, `Hello`/`Welcome`/`ErrorMsg` |
-| `relay` | Server-side tunnel bookkeeping, routing and events | `Server`, `client`, `tunnel`, `KeyValidator`, `Event`/`TunnelInfo`/`RequestInfo` |
+| `relay` | Server-side tunnel bookkeeping, routing, load balancing and events | `Server`, `client`, `tunnel`, `tunnelSet`, `KeyValidator`, `Event`/`TunnelInfo`/`RequestInfo` |
 | `agent` | Client-side lifecycle and bridging | `Agent` |
 | `auth` | Argon2id hashing and secret generation | — |
 | `store` | Api key persistence and validation | `Store`, `KeyInfo`, `KeyIdentity`, `Limits` |
@@ -138,6 +140,8 @@ why HTTP and TCP tunnels share one code path (`protocol.Bridge`).
 | `admin` | Admin HTTP API client used by the CLI | `CreateKey`, `ListKeys`, `RevokeKey` |
 | `server` | Versioned control API + SSE + embedded dashboard | `NewHandler`, `handleStream` |
 | `config` | Config file read/write | `AgentConfig` |
+| `keyring` | OS-keyring secrets (`keyring:NAME` refs) | `Ring`, `Resolve` |
+| `metrics` | Prometheus text-format registry | `Registry`, `Counter`, `Gauge` |
 | `units` | Size/duration parsing (`ParseSize`, `ParseTTL`) | — |
 
 ---
@@ -171,6 +175,7 @@ payload so a misbehaving peer cannot exhaust memory.
 | `FrameControl` | 4 | both | JSON control message |
 | `FramePing` | 5 | both | (none) — keepalive probe |
 | `FramePong` | 6 | both | (none) — reply, updates `lastPong` |
+| `FrameWindow` | 7 | both | 8-byte big-endian byte count — credit granted on a stream |
 
 ### Control messages (JSON)
 
@@ -251,12 +256,19 @@ The `type` field disambiguates; the wire types are defined in
    counterpart and pushes it onto the accept queue; its `Meta()` is the tunnel
    id used to find the local target.
 2. **Data:** each side writes `FrameData` frames tagged with the stream id. The
-   receiver buffers chunks in a per-stream channel (`streamRecvCap`, 256
-   chunks) and the consumer reads them through the `net.Conn` adapter.
-3. **Close:** either side sends `FrameClose`; the peer's reader observes EOF
+   receiver appends payloads to a per-stream byte buffer (`buf`, capped at
+   `streamBufMax` = 2× the send window); the consumer reads them through the
+   `net.Conn` adapter.
+3. **Window:** each stream has a 256 KiB send window (`streamWindowSize`).
+   `Write` blocks once the peer's unacked bytes reach the window and waits on
+   `winCond` for credit; the reader grants `FrameWindow` credit via `maybeGrant`
+   every time it drains half the window (`streamWindowHalf`), so a slow
+   consumer only blocks its own stream's writer, never the mux read loop or
+   other streams.
+4. **Close:** either side sends `FrameClose`; the peer's reader observes EOF
    once buffered data drains. A stream is evicted from the map only after both
    sides have closed (this guarantees no data is lost in flight).
-4. **Teardown:** `Mux.Close()` force-terminates every live stream and closes
+5. **Teardown:** `Mux.Close()` force-terminates every live stream and closes
    the underlying connection.
 
 ### The `net.Conn` adapter
@@ -265,9 +277,9 @@ The `type` field disambiguates; the wire types are defined in
 the server use plain `io.Copy`/`net/http` against streams as if they were real
 sockets:
 
-- `Read` drains the per-stream buffer channel; returns `io.EOF` after the peer
-  closes and buffered data is exhausted.
-- `Write` sends a `FrameData`.
+- `Read` drains the per-stream byte buffer; returns `io.EOF` after the peer
+  closes and buffered data is exhausted, granting window credit as it goes.
+- `Write` consumes send-window credit and blocks until the peer grants more.
 - `SetDeadline*` are no-ops (deadlines are managed at the mux/HTTP layer).
 
 ### Keepalive / liveness
@@ -278,13 +290,18 @@ sockets:
   frames for 90 s (`keepAliveDead`).
 - A failed ping closes the mux, which triggers the agent's reconnect path.
 
-### Flow control (current limitation)
+### Flow control
 
-Backpressure is **per-connection**: when a stream's receive buffer is full,
-the mux read loop stalls, which slows all streams on the same tunnel until the
-consumer catches up. This is safe (nothing is dropped) but means one slow
-consumer can affect throughput of others. Explicit per-stream windows are
-planned (roadmap Phase 7).
+Backpressure is **per-stream** via explicit send windows (`FrameWindow`).
+Each stream starts with a 256 KiB window (`streamWindowSize`); a `Write`
+sends up to the available credit and blocks (`winCond`) until the peer grants
+more. The receiver's byte buffer is capped at `streamBufMax` (2× the window)
+and grants `FrameWindow` credit in `streamWindowHalf` increments as the
+consumer drains it. A slow consumer therefore stalls only its own writer —
+other streams on the same tunnel keep flowing — and a peer that over-sends is
+backed up at its `Write` (its send-window credit) rather than at the mux read
+loop. Both ends ship in one release, so the protocol needs no version
+negotiation for this.
 
 ---
 
@@ -313,7 +330,10 @@ TCP port range is exhausted.
 1. Client → server: `GET https://7f3a9c21.example.com/foo`.
 2. `relay.serveHTTP` strips the port from the `Host` header and looks up the
    virtual host in the registry (exact match; unknown hosts get a 404, the
-   base domain gets a landing page, `/healthz` returns JSON status).
+   base domain gets a landing page, `/healthz` returns JSON status). HTTP
+   tunnels are grouped in a `tunnelSet`; `serveHTTP` picks one tunnel with
+   `tunnelSet.pick()` (least active connections, round-robin on ties), so
+   several agents may serve the same subdomain.
 3. The server calls `client.openStream(tunnelID)` → sends `FrameOpen` and gets
    a `Stream`.
 4. The server serializes the incoming request onto the stream with
@@ -322,6 +342,9 @@ TCP port range is exhausted.
    request bytes reach the app exactly as written.
 6. The app's raw response travels back; the server reads it with
    `http.ReadResponse` and writes status, headers and body to the client.
+
+The picked tunnel is also used for the IP/auth/rate checks, so agents sharing
+a subdomain should configure identical tunnel options.
 
 ### A WebSocket / upgrade request
 
@@ -500,7 +523,23 @@ moved ahead of positionals (while keeping flag/value pairs together via the
   embedded dashboard. `internal/admin` now holds the *client* that the CLI uses.
   Requests are authenticated with `--admin-key` (Bearer header or `?token=` for
   the SSE stream) compared in constant time. Requests without an admin key get
-  401; an empty `--admin-key` disables the API (503).
+  401; an empty `--admin-key` disables the API (503). The same listener serves
+  `GET /metrics` (Prometheus text format) behind the admin auth.
+- **Metrics (Phase 7):** `internal/metrics` is a stdlib-only registry with
+  labeled counters/gauges and a Prometheus text-format renderer. `relay.New`
+  registers `kproxy_requests_total` and `kproxy_tunnel_bytes_total`
+  (labels `tunnel` + `proto`; counters attributed to the serving agent) plus
+  gauge `kproxy_tunnels`, `kproxy_agents`, `kproxy_uptime_seconds` and
+  `kproxy_version_info`. `Server.MetricsHandler()` refreshes gauges on each
+  scrape; `internal/server` mounts it at `/metrics` behind `admin.Auth`.
+- **Keyring (Phase 7):** `internal/keyring` stores secrets under
+  `os.UserConfigDir()/kproxy/keyring.json`. On Windows (`win_dpapi.go`,
+  `//go:build windows`) values are encrypted with DPAPI in local-machine scope
+  (works for service accounts) via `crypt32.dll` syscalls and stored base64 —
+  no cgo. On other platforms (`file_plain.go`) the file itself (0600) is the
+  protection. `keyring.Resolve` expands `keyring:NAME` references; the CLI
+  (`kproxy keyring set|get|rm|list`) and both `--api-key`/`--admin-key`
+  resolvers use it.
 - **Control API + dashboard:** `internal/server.NewHandler(srv, store, adminKey)`
   serves `GET /api/v1/tunnels` (live snapshot from `relay.Server.Tunnels()`),
   `GET /api/v1/tunnels/stream` (SSE: `tunnel_open`/`tunnel_close`/`request`
@@ -545,6 +584,24 @@ Cover the multiplexer in isolation over `net.Pipe`:
 - ping/pong
 - mux close terminates live streams
 - `protocol.Bridge` byte echo
+- **slow stream does not block others** (`TestSlowStreamDoesNotBlockOthers`)
+- **`Write` blocks on an exhausted window** (`TestWriteBlocksOnExhaustedWindow`)
+- **large transfer round-trip** over the windowed stream
+  (`TestLargeTransferRoundTrip`)
+
+### Fuzzing — `internal/protocol/fuzz_test.go`, `internal/relay/fuzz_test.go`
+
+Fuzz targets run as normal tests on their seed corpus and under `go test
+-fuzz`:
+
+- `FuzzReadFrame` — frame parser never panics and never accepts a payload
+  over `maxFrameSize`
+- `FuzzControlRoundTrip` — the JSON control codec is idempotent
+  (encode∘decode is a fixed point)
+- `FuzzUnmarshalControl` — arbitrary bytes through `UnmarshalControl`/
+  `UnmarshalError` never panic
+- `FuzzApplySpecOptions` — hostile tunnel specs (`basic_auth`, IP lists, size/
+  timeout strings) never panic server-side parsing
 
 ### Integration tests — `internal/relay/relay_test.go`
 
@@ -589,6 +646,9 @@ Spin up a real `relay.Server` with HTTP + control listeners and a real
 - **domain verification** — with a fake `TXTLookup`, a verified custom domain
   is honored (cached), an unverified/NXDOMAIN one is rejected with the TXT
   value to publish, and a server without `--verify-key` returns no token
+- **load balancing** — two agents claiming the same subdomain both serve
+  traffic (least-active / round-robin) and the survivor keeps serving after
+  one disconnects (`TestLoadBalancedHTTPTunnels`)
 
 The `testEnv` harness builds a server on ephemeral ports and registers cleanup
 with `t.Cleanup`, so tests are hermetic and parallel-safe.
@@ -637,6 +697,11 @@ Exercise the embedded dashboard handler end-to-end over HTTP with a real relay
   bad size rejected
 - `internal/units`: `ParseSize` (`b`/`kb`/`mb`/`gb`, bad input) and `ParseTTL`
   (`ms`/`s`/`m`/`h`/`d`/`w`)
+- `internal/metrics`: labeled counter/gauge increment and render to Prometheus
+  text format
+- `internal/keyring`: set/get/delete/list/resolve round trip, persistence
+  across reopen, `keyring:NAME` resolution (incl. missing entry), invalid-name
+  rejection — exercising the real Windows DPAPI path in CI
 - `internal/protocol`: `TunnelSpec` JSON round-trip preserves the security
   fields and omits them when empty
 - `cmd/kproxy` `key` subcommands against a real admin handler (create → list →
@@ -685,6 +750,7 @@ make dist       # GoReleaser snapshot: archives + deb/rpm for every platform (ne
 make docker     # docker build the relay image from packaging/Dockerfile (needs docker)
 make test       # go test ./...
 make race       # go test -race -count=1 ./...
+make fuzz       # brief `go test -fuzz` run over the Fuzz* targets (protocol + relay)
 make vet        # go vet ./...
 make fmt        # gofmt -l -w cmd internal
 make clean
@@ -790,7 +856,7 @@ them in `internal/admin`, and surface them in `kproxy key ...`.
 
 ## 12. Status & roadmap
 
-**Implemented (Phases 0–6):** protocol & multiplexer, HTTP + TCP tunnels,
+**Implemented (Phases 0–7):** protocol & multiplexer, HTTP + TCP tunnels,
 hash / custom subdomains, custom domains, TCP port pinning, multi-tunnel
 config files, WebSocket upgrades, reconnect with backoff, keepalives,
 graceful tunnel close + local-target auto-recovery, per-user API keys
@@ -802,12 +868,13 @@ verify-token`), versioned control API (`/api/v1/*`), live tunnel list +
 real-time request inspector (SSE) + key CRUD in an embedded React dashboard,
 TLS (ACME + static certs), config persistence, JSON logs, CI, full test
 suite, cross-platform build, packaging (GoReleaser archives + deb/rpm +
-Windows MSI via WiX, systemd unit, Docker image, one-command bootstrap).
+Windows MSI via WiX, systemd unit, Docker image, one-command bootstrap),
+Prometheus metrics (`/metrics` behind admin auth), load-balanced tunnels
+(`tunnelSet`), per-stream flow control (`FrameWindow`), OS-keyring secret
+storage (DPAPI on Windows), and fuzzing of the frame parser + control codec.
 
-**Planned (see [docs/roadmap.md](docs/roadmap.md)):**
-
-1. **Phase 7** — hardening: Prometheus metrics, flow control, load-balanced
-   tunnels, OS keyring, fuzzing.
+**Planned (see [docs/roadmap.md](docs/roadmap.md)):** structured request logs
+with redaction and retention.
 
 ---
 

@@ -374,15 +374,15 @@ type Stream struct {
 	id   uint64
 	meta []byte
 
-	mu     sync.Mutex
-	cond   *sync.Cond // buffer data available / space available
+	mu      sync.Mutex
+	cond    *sync.Cond // buffer data available / space available
 	winCond *sync.Cond // send credit available
-	buf    []byte
-	bufEOF bool
+	buf     []byte
+	bufEOF  bool
 
-	sendWin     int64
+	sendWin      int64
 	recvConsumed int64
-	closedBy    uint8
+	closedBy     uint8
 }
 
 // newStream returns an unregistered stream. The caller decides whether it was
@@ -413,10 +413,10 @@ func (s *Stream) Meta() []byte { return s.meta }
 // closing.
 func (s *Stream) push(b []byte) {
 	s.mu.Lock()
-	for len(s.buf)+len(b) > streamBufMax && s.closedBy == 0 && !s.bufEOF && !s.mux.isClosed() {
+	for len(s.buf)+len(b) > streamBufMax && !s.bufEOF && !s.mux.isClosed() {
 		s.cond.Wait()
 	}
-	if s.closedBy != 0 || s.bufEOF || s.mux.isClosed() {
+	if s.bufEOF || s.mux.isClosed() {
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		return

@@ -79,8 +79,10 @@ func (s *Server) Tunnels() []TunnelInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]TunnelInfo, 0, len(s.httpTunnels)+len(s.tcpTunnels))
-	for _, t := range s.httpTunnels {
-		out = append(out, t.info())
+	for _, set := range s.httpTunnels {
+		for t := range set.tunnels {
+			out = append(out, t.info())
+		}
 	}
 	for _, t := range s.tcpTunnels {
 		out = append(out, t.info())
@@ -123,9 +125,11 @@ func (s *Server) Status() Status {
 		Tunnels: len(s.httpTunnels) + len(s.tcpTunnels),
 		Agents:  len(s.agents),
 	}
-	for _, t := range s.httpTunnels {
-		st.Requests += t.requests.Load()
-		st.Bytes += t.bytes.Load()
+	for _, set := range s.httpTunnels {
+		for t := range set.tunnels {
+			st.Requests += t.requests.Load()
+			st.Bytes += t.bytes.Load()
+		}
 	}
 	for _, t := range s.tcpTunnels {
 		st.Requests += t.requests.Load()
@@ -154,8 +158,8 @@ func (s *Server) MetricsHandler() http.Handler {
 func (s *Server) refreshGauges() {
 	s.mu.RLock()
 	httpN, tcpN := 0, 0
-	for range s.httpTunnels {
-		httpN++
+	for _, set := range s.httpTunnels {
+		httpN += len(set.tunnels)
 	}
 	for range s.tcpTunnels {
 		tcpN++

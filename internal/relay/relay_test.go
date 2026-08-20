@@ -1540,3 +1540,94 @@ func TestDomainVerification(t *testing.T) {
 		t.Fatalf("disabled verification returned token %q", got)
 	}
 }
+
+// TestLoadBalancedHTTPTunnels verifies that two agents claiming the same
+// subdomain both receive traffic (least-connections / round-robin) and that
+// the survivor keeps serving after one agent disconnects.
+func TestLoadBalancedHTTPTunnels(t *testing.T) {
+	e := newEnv(t)
+
+	mk := func(body string) string {
+		ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, body)
+		}))
+		t.Cleanup(ls.Close)
+		return strings.TrimPrefix(ls.URL, "http://")
+	}
+	targetA, targetB := mk("A"), mk("B")
+
+	runAgent := func(target string) *agent.Agent {
+		ag := agent.New(agent.Config{
+			ServerURL: "http://" + e.controlAddr,
+			Tunnels: []protocol.TunnelSpec{
+				{ID: "main", Proto: "http", Local: target, Subdomain: "lb"},
+			},
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go ag.Run(ctx)
+		t.Cleanup(func() { cancel(); ag.Close() })
+		return ag
+	}
+	agA := runAgent(targetA)
+	agB := runAgent(targetB)
+
+	// Poll until both agents are registered on the same host.
+	var host string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, tn := range e.srv.Tunnels() {
+			if tn.Host == "lb.kproxy.test" {
+				host = tn.Host
+			}
+		}
+		if e.srv.Tunnels() != nil && len(e.srv.Tunnels()) == 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if host != "lb.kproxy.test" {
+		t.Fatalf("load-balanced host not registered")
+	}
+	if got := len(e.srv.Tunnels()); got != 2 {
+		t.Fatalf("tunnels = %d, want 2", got)
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 8; i++ {
+		resp, err := e.do("GET", host, "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		counts[string(b)]++
+	}
+	if counts["A"] == 0 || counts["B"] == 0 {
+		t.Fatalf("expected both agents to serve traffic, got %v", counts)
+	}
+
+	// Kill agent A: requests must still succeed via agent B.
+	agA.Close()
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(e.srv.Tunnels()) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for i := 0; i < 3; i++ {
+		resp, err := e.do("GET", host, "/", nil)
+		if err != nil {
+			t.Fatalf("request after failover: %v", err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(b) != "B" {
+			t.Fatalf("failover response = %d %q, want 200 B", resp.StatusCode, b)
+		}
+	}
+	_ = agB
+}

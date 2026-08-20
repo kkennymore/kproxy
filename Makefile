@@ -4,7 +4,7 @@ GORELEASER ?= goreleaser
 BIN := bin
 WEB_DIST := internal/server/dashboard
 
-.PHONY: all build build-server build-agent web test vet fmt race clean dist docker install
+.PHONY: all build build-server build-agent web test vet fmt race fuzz clean dist docker install
 
 all: build
 
@@ -27,6 +27,11 @@ test:
 
 race:
 	$(GO) test -race -count=1 ./...
+
+# Run the fuzz targets briefly to shake out crashes/counterexamples.
+fuzz:
+	$(GO) test ./internal/protocol/ ./internal/relay/ -run '^$$' \
+		-fuzz '^Fuzz' -fuzztime=20s -parallel=1
 
 vet:
 	$(GO) vet ./...

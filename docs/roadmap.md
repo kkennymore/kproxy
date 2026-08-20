@@ -2,7 +2,7 @@
 
 ## Status
 
-Phases 0–6 are implemented and tested. Remaining phases extend the foundation
+Phases 0–7 are implemented and tested. Remaining phases extend the foundation
 without redesigning it.
 
 ## Phase 2 — Multi-tunnel ergonomics ✅
@@ -178,14 +178,42 @@ Done:
   archives, 4 packages), archive `--version`, silent MSI install → run →
   uninstall for both kproxy and kproxyd, and the deb layout.
 
-## Phase 7 — Hardening & observability
+## Phase 7 — Hardening & observability ✅
 
-- Prometheus `/metrics` (tunnels, streams, bandwidth, latency).
+Done:
+
+- **Prometheus metrics** (`internal/metrics`): stdlib-only registry with
+  labeled counters/gauges and text-format rendering. The relay exports
+  `GET /metrics` on the admin listener behind `admin.Auth`:
+  `kproxy_requests_total`, `kproxy_tunnel_bytes_total` (both keyed by
+  `tunnel` + `proto`), `kproxy_tunnels`, `kproxy_agents`, uptime and version
+  gauges. HTTP/TCP/upgrade paths increment and attribute bytes to the serving
+  agent.
+- **Flow control** (`internal/protocol/mux.go`): per-stream byte buffer with a
+  256 KB send window; peers grant `FrameWindow` as the consumer drains half
+  the window, and a `Write` blocks until credit is replenished. A slow
+  consumer no longer stalls other streams, the receive buffer is capped at
+  2× the window, and the frame reader is extracted for fuzzing.
+- **Load-balanced tunnels** (`internal/relay`): HTTP tunnels are grouped in a
+  `tunnelSet`; several agents may claim the same subdomain and public traffic
+  is distributed by least-active-connections (round-robin on ties). A dead
+  agent is removed from the set on disconnect and the survivor keeps serving.
+- **OS keyring** (`internal/keyring`): Windows secrets are encrypted with
+  DPAPI (local-machine scope, works for services) before being written to
+  `%APPDATA%\kproxy\keyring.json`; macOS/Linux use an owner-only (0600) JSON
+  file (no cgo). `--api-key`/`--admin-key` accept `keyring:NAME` references,
+  and `kproxy keyring set|get|rm|list` manages entries (stdin for `set`).
+  kproxyd's `--admin-key` resolves the same way.
+- **Fuzzing**: `FuzzReadFrame` (frame parser, payload-size cap),
+  `FuzzControlRoundTrip` (JSON codec stability), `FuzzUnmarshalControl`,
+  `FuzzApplySpecOptions` (hostile tunnel specs). `go test -fuzz` runs green.
+
+Remaining candidates from the original Phase 7 scope (structured request logs
+with retention) are tracked below for a future phase.
+
+## Phase 8 — Observability extras (candidate)
+
 - Structured request logs with redaction; optional replay/log retention.
-- Load-balancing tunnels: several agents share one subdomain (round-robin).
-- Flow control (per-stream window) and resource limits.
-- Security audit: TLS settings, token storage (OS keyring), fuzzing of the
-  frame parser.
 
 ## Extension guide
 

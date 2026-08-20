@@ -1,6 +1,6 @@
 // Package config manages kproxy client configuration files. Secrets (the API
-// key) are stored with restrictive file permissions; callers may prefer the
-// OS keyring instead, which is a planned extension.
+// key) are stored with restrictive file permissions; callers may instead use
+// the OS-backed keyring (internal/keyring) via keyring:NAME references.
 package config
 
 import (
